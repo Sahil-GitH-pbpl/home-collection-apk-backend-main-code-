@@ -1,4 +1,5 @@
 ﻿import json
+from datetime import datetime, time, timedelta
 from collections import defaultdict
 from typing import Sequence
 from uuid import uuid4
@@ -448,6 +449,24 @@ class BookingRepository:
             grouped[booking_id].append(name)
 
         return {bid: ", ".join(names) for bid, names in grouped.items()}
+
+    @staticmethod
+    def _within_4am_window_for_date(visit_date: object, now_dt: datetime | None = None) -> bool:
+        if visit_date is None:
+            return False
+        if now_dt is None:
+            now_dt = datetime.now()
+        if hasattr(visit_date, 'year') and hasattr(visit_date, 'month') and hasattr(visit_date, 'day'):
+            d = visit_date
+        else:
+            try:
+                d = datetime.strptime(str(visit_date), "%Y-%m-%d").date()
+            except Exception:
+                return False
+        start_dt = datetime.combine(d, time(4, 0, 0))
+        end_dt = start_dt + timedelta(days=1)
+        return start_dt <= now_dt < end_dt
+
     def get_my_assigned_merged(
         self,
         user_id: int,
@@ -484,6 +503,11 @@ class BookingRepository:
             include_terminal=include_terminal,
         )
         merged = booking_items + appointment_items
+        now_dt = datetime.now()
+        merged = [
+            item for item in merged
+            if self._within_4am_window_for_date(item.get("preferred_visit_date"), now_dt=now_dt)
+        ]
         booking_ids_for_names = [int(item.get("booking_id")) for item in merged if self._to_int(item.get("booking_id"))]
         names_map = self.get_patient_names_by_booking_ids(booking_ids_for_names)
         for item in merged:
@@ -572,6 +596,7 @@ class BookingRepository:
                 HomeCollectionBookingPatient.selected_charge_modes,
                 HomeCollectionBookingPatient.selected_panel_companies,
                 HomeCollectionBookingPatient.additional_discount_amount,
+                HomeCollectionBookingPatient.prescription_files.label("bp_prescription_files"),
                 PatientMaster,
             )
             .join(
@@ -898,6 +923,30 @@ class BookingRepository:
                 )
                 final_status = 2
 
+            elif action == "stop":
+                self.db.execute(
+                    text(
+                        """
+                        UPDATE hhome_collection_booking
+                        SET booking_status = 1
+                        WHERE id = :booking_id
+                        """
+                    ),
+                    {"booking_id": booking_id},
+                )
+                self.db.execute(
+                    text(
+                        """
+                        UPDATE hhome_collection_booking_patient
+                        SET booking_patient_status = 1
+                        WHERE booking_id = :booking_id
+                          AND booking_patient_status = 2
+                        """
+                    ),
+                    {"booking_id": booking_id},
+                )
+                final_status = 1
+
             elif action == "complete":
                 if not self.booking_has_patients(booking_id):
                     raise ValueError("No patients found for this booking")
@@ -920,7 +969,7 @@ class BookingRepository:
                 )
                 self._update_pending_tests_status(
                     booking_id=booking_id,
-                    to_status=2,
+                    to_status=1,
                 )
                 status_counts_after = self.get_booking_patient_status_counts(booking_id)
                 all_completed = (
@@ -977,7 +1026,7 @@ class BookingRepository:
                 )
                 self._update_pending_tests_status(
                     booking_id=booking_id,
-                    to_status=1,
+                    to_status=2,
                 )
                 final_status = 4
             else:
@@ -989,6 +1038,172 @@ class BookingRepository:
 
         patient_rows = self.get_booking_patient_status_rows(booking_id)
         return final_status, patient_rows
+
+    def _insert_booking_action_audit(
+        self,
+        booking_id: int,
+        action_type: str,
+        reason_text: str,
+        old_values: dict | None,
+        new_values: dict | None,
+        done_by: int,
+    ) -> None:
+        self.db.execute(
+            text(
+                """
+                INSERT INTO hbooking_action_audit
+                (booking_id, action_type, reason_text, old_values_json, new_values_json, done_by)
+                VALUES (:booking_id, :action_type, :reason_text, :old_values_json, :new_values_json, :done_by)
+                """
+            ),
+            {
+                "booking_id": int(booking_id),
+                "action_type": str(action_type or "").strip() or None,
+                "reason_text": str(reason_text or "").strip() or None,
+                "old_values_json": json.dumps(old_values, ensure_ascii=False) if old_values is not None else None,
+                "new_values_json": json.dumps(new_values, ensure_ascii=False) if new_values is not None else None,
+                "done_by": int(done_by or 0),
+            },
+        )
+
+    def cancel_booking_with_lead(
+        self,
+        booking_id: int,
+        actor_user_id: int,
+        reason_text: str,
+        remark: str | None = None,
+        reschedule_requested: bool = False,
+        proposed_visit_date: str | None = None,
+        proposed_time_slot: str | None = None,
+    ) -> tuple[int, bool, str | None]:
+        reason = str(reason_text or "").strip()
+        if not reason:
+            raise ValueError("Cancel reason is required")
+
+        booking = self.db.execute(
+            text(
+                """
+                SELECT id, booking_code, caller_id, booking_status, preferred_visit_date, preferred_time_slot
+                FROM hhome_collection_booking
+                WHERE id=:booking_id
+                LIMIT 1
+                FOR UPDATE
+                """
+            ),
+            {"booking_id": int(booking_id)},
+        ).mappings().first()
+        if not booking:
+            raise ValueError("Booking not found")
+
+        status_now = int(booking.get("booking_status") or 0)
+        if status_now in {3, 4}:
+            raise ValueError("Completed/Cancelled booking cannot be cancelled")
+
+        self.db.execute(
+            text("UPDATE hhome_collection_booking SET booking_status=4 WHERE id=:booking_id"),
+            {"booking_id": int(booking_id)},
+        )
+        self.db.execute(
+            text(
+                """
+                UPDATE hhome_collection_booking_patient
+                SET booking_patient_status=4
+                WHERE booking_id=:booking_id
+                  AND booking_patient_status IN (0,1,2)
+                """
+            ),
+            {"booking_id": int(booking_id)},
+        )
+        self._update_pending_tests_status(
+            booking_id=int(booking_id),
+            to_status=2,
+        )
+
+        lead_created = False
+        lead_id = None
+
+        lead_meta = self.db.execute(
+            text(
+                """
+                SELECT cm.primary_mobile,
+                       GROUP_CONCAT(DISTINCT TRIM(CONCAT_WS(' ', p.title, p.full_name)) ORDER BY p.full_name SEPARATOR ', ') AS patient_names,
+                       COUNT(DISTINCT bp.patient_id) AS patient_count
+                FROM hhome_collection_booking b
+                INNER JOIN hcaller_master cm ON cm.id=b.caller_id
+                LEFT JOIN hhome_collection_booking_patient bp ON bp.booking_id=b.id
+                LEFT JOIN hpatient_master p ON p.id=bp.patient_id
+                WHERE b.id=:booking_id
+                GROUP BY cm.primary_mobile
+                """
+            ),
+            {"booking_id": int(booking_id)},
+        ).mappings().first() or {}
+
+        mobile = str(lead_meta.get("primary_mobile") or "").strip()
+        patient_names = str(lead_meta.get("patient_names") or "").strip()
+        patient_count = int(lead_meta.get("patient_count") or 0)
+        remark_txt = str(remark or "").strip()
+
+        res_note = "Reschedule not requested."
+        if bool(reschedule_requested):
+            if (proposed_visit_date or "").strip() and (proposed_time_slot or "").strip():
+                res_note = f"Reschedule requested for {str(proposed_visit_date).strip()} {str(proposed_time_slot).strip()}."
+            else:
+                res_note = "Reschedule requested; date/slot to be finalized."
+
+        lead_summary = f"This was a Home Collection booking cancelled due to {reason}. {res_note}"
+        if remark_txt:
+            lead_summary = f"{lead_summary} Remark: {remark_txt}"
+
+        if bool(reschedule_requested) and mobile:
+            self.db.execute(
+                text(
+                    """
+                    INSERT INTO leads
+                    (phone, wa_only, name, alt_phone, alt_wa_only, visit_window, prescription, remarks, tags, num_patients, created_by, status)
+                    VALUES (:phone, 0, :name, '', 0, 'Flexible', '', :remarks, 'home_collection_cancel', :num_patients, :created_by, 'Open')
+                    """
+                ),
+                {
+                    "phone": mobile,
+                    "name": patient_names or "Home Collection Cancellation",
+                    "remarks": lead_summary,
+                    "num_patients": max(1, patient_count),
+                    "created_by": str(actor_user_id),
+                },
+            )
+            new_id_row = self.db.execute(text("SELECT LAST_INSERT_ID() AS lid")).mappings().first() or {}
+            new_pk = int(new_id_row.get("lid") or 0)
+            if new_pk > 0:
+                lead_id = f"LD-{new_pk:03d}"
+                self.db.execute(
+                    text("UPDATE leads SET lead_id=:lead_id WHERE id=:id"),
+                    {"lead_id": lead_id, "id": new_pk},
+                )
+                lead_created = True
+
+        self._insert_booking_action_audit(
+            booking_id=int(booking_id),
+            action_type="CANCEL",
+            reason_text=(f"{reason} | {remark_txt}" if remark_txt else reason),
+            old_values={
+                "preferred_visit_date": str(booking.get("preferred_visit_date") or ""),
+                "preferred_time_slot": str(booking.get("preferred_time_slot") or "").strip(),
+                "booking_status": status_now,
+            },
+            new_values={
+                "booking_status": 4,
+                "reschedule_requested": bool(reschedule_requested),
+                "proposed_visit_date": str(proposed_visit_date or "").strip() or None,
+                "proposed_time_slot": str(proposed_time_slot or "").strip() or None,
+                "lead_created": lead_created,
+                "lead_id": lead_id,
+            },
+            done_by=int(actor_user_id),
+        )
+
+        self.db.commit()
+        return 4, lead_created, lead_id
 
     def apply_appointment_action(
         self,
@@ -1047,6 +1262,7 @@ class BookingRepository:
         action_to_status = {
             "assign": 1,
             "start": 2,
+            "stop": 1,
             "complete": 3,
             "cancel": 4,
         }
@@ -1104,6 +1320,19 @@ class BookingRepository:
                     ),
                     patient_params,
                 )
+            elif action == "stop":
+                self.db.execute(
+                    text(
+                        f"""
+                        UPDATE hhome_collection_booking_patient
+                        SET booking_patient_status = 1
+                        WHERE booking_id = :booking_id
+                          AND booking_patient_status = 2
+                          {scope_sql}
+                        """
+                    ),
+                    patient_params,
+                )
             elif action == "complete":
                 self.db.execute(
                     text(
@@ -1119,7 +1348,7 @@ class BookingRepository:
                 )
                 self._update_pending_tests_status(
                     booking_id=booking_id,
-                    to_status=2,
+                    to_status=1,
                     patient_ids=selected_ids if selected_ids else None,
                 )
             elif action == "cancel":
@@ -1137,7 +1366,7 @@ class BookingRepository:
                 )
                 self._update_pending_tests_status(
                     booking_id=booking_id,
-                    to_status=1,
+                    to_status=2,
                     patient_ids=selected_ids if selected_ids else None,
                 )
             self.db.commit()
@@ -1204,7 +1433,7 @@ class BookingRepository:
                 )
                 self._update_pending_tests_status(
                     booking_id=booking_id,
-                    to_status=1,
+                    to_status=2,
                     patient_ids=[patient_id],
                 )
             self.db.commit()
@@ -1837,17 +2066,18 @@ class BookingRepository:
             {"patient_documents": csv_value, "patient_id": patient_id},
         )
 
-    def get_patient_prescription_paths(self, patient_id: int) -> list[str]:
+    def get_patient_prescription_paths(self, booking_id: int, patient_id: int) -> list[str]:
         row = self.db.execute(
             text(
                 """
                 SELECT prescription_files
-                FROM hpatient_master
-                WHERE id = :patient_id
+                FROM hhome_collection_booking_patient
+                WHERE booking_id = :booking_id AND patient_id = :patient_id
+                ORDER BY id DESC
                 LIMIT 1
                 """
             ),
-            {"patient_id": patient_id},
+            {"booking_id": int(booking_id), "patient_id": int(patient_id)},
         ).fetchone()
         if not row or row.prescription_files is None:
             return []
@@ -1856,17 +2086,17 @@ class BookingRepository:
             return []
         return [x.strip() for x in raw.split(",") if x.strip()]
 
-    def update_patient_prescription_files(self, patient_id: int, files: list[str]) -> None:
+    def update_patient_prescription_files(self, booking_id: int, patient_id: int, files: list[str]) -> None:
         csv_value = ",".join(files)
         self.db.execute(
             text(
                 """
-                UPDATE hpatient_master
+                UPDATE hhome_collection_booking_patient
                 SET prescription_files = :prescription_files
-                WHERE id = :patient_id
+                WHERE booking_id = :booking_id AND patient_id = :patient_id
                 """
             ),
-            {"prescription_files": csv_value, "patient_id": patient_id},
+            {"prescription_files": csv_value, "booking_id": int(booking_id), "patient_id": int(patient_id)},
         )
 
 
@@ -1883,7 +2113,7 @@ class BookingRepository:
         credit_amount: float = 0.0,
         paying_amount: float = 0.0,
     ) -> tuple[int, int]:
-        active_expr = "CASE WHEN test_status IS NULL OR TRIM(test_status)='' THEN 0 WHEN UPPER(TRIM(test_status)) IN ('PENDING','0') THEN 0 WHEN UPPER(TRIM(test_status)) IN ('DROPPED','CANCELLED','1') THEN 1 WHEN UPPER(TRIM(test_status)) IN ('COMPLETED','2') THEN 2 ELSE 0 END"
+        active_expr = "CASE WHEN test_status IS NULL OR TRIM(test_status)='' THEN 0 WHEN UPPER(TRIM(test_status)) IN ('PENDING','0') THEN 0 WHEN UPPER(TRIM(test_status)) IN ('COMPLETED','1') THEN 1 WHEN UPPER(TRIM(test_status)) IN ('DROPPED','CANCELLED','2') THEN 2 ELSE 0 END"
         bp_rows = self.db.execute(
             text("SELECT id, patient_id FROM hhome_collection_booking_patient WHERE booking_id=:booking_id"),
             {"booking_id": booking_id},
@@ -1924,7 +2154,7 @@ class BookingRepository:
         dropped_count = 0
         if to_drop:
             self.db.execute(
-                text("UPDATE hhome_collection_booking_patient_test SET test_status='1', dropped_at=NOW(), dropped_by=:uid WHERE id IN :ids").bindparams(bindparam("ids", expanding=True)),
+                text("UPDATE hhome_collection_booking_patient_test SET test_status='2', dropped_at=NOW(), dropped_by=:uid WHERE id IN :ids").bindparams(bindparam("ids", expanding=True)),
                 {"uid": actor_user_id, "ids": to_drop},
             )
             dropped_count = len(to_drop)
@@ -2130,6 +2360,22 @@ class BookingRepository:
         except Exception:
             return
 
+    def acquire_global_completion_lock(self, wait_timeout_sec: int = 180) -> bool:
+        lock_key = "hcb_complete_global"
+        try:
+            row = self.db.execute(text("SELECT GET_LOCK(:k, :t) AS ok"), {"k": lock_key, "t": int(wait_timeout_sec)}).fetchone()
+            ok = int(getattr(row, "ok", row[0] if row else 0) or 0)
+            return ok == 1
+        except Exception:
+            return False
+
+    def release_global_completion_lock(self) -> None:
+        lock_key = "hcb_complete_global"
+        try:
+            self.db.execute(text("SELECT RELEASE_LOCK(:k)"), {"k": lock_key})
+        except Exception:
+            return
+
     def set_patient_payment_screenshots(self, booking_id: int, patient_id: int, rel_paths: list[str]) -> None:
         cols = self._get_table_columns("hhome_collection_booking_patient")
         if "payment_screenshot_paths" not in cols:
@@ -2200,6 +2446,12 @@ class BookingRepository:
             if "sample_collection_is" in cols and row.get("sample_collection_is") is not None:
                 updates_sql.append("sample_collection_is=:sample_collection_is")
                 params["sample_collection_is"] = str(row.get("sample_collection_is") or "").strip().lower() or None
+            if "additional_sample" in cols and row.get("additional_sample") is not None:
+                aval = row.get("additional_sample")
+                if isinstance(aval, list):
+                    aval = ",".join([str(x).strip() for x in aval if str(x).strip()])
+                updates_sql.append("additional_sample=:additional_sample")
+                params["additional_sample"] = str(aval or "").strip() or None
             if "additional_discount_amount" in cols and row.get("additional_discount_amount") is not None:
                 updates_sql.append("additional_discount_amount=:additional_discount_amount")
                 params["additional_discount_amount"] = float(row.get("additional_discount_amount") or 0)
@@ -2254,6 +2506,115 @@ class BookingRepository:
                         tags.append("tough vein")
                         self.db.execute(text("UPDATE hpatient_master SET tag=:tag WHERE id=:pid"), {"tag": ",".join(tags), "pid": patient_id})
 
+    def _is_manual_hcb_slip(self, value: object) -> bool:
+        v = str(value or "").strip().lower()
+        return v in {"manual hcb slip", "manual_hcb_slip", "manual hc slip", "manual_hc_slip", "manual_slip", "manual-slip", "hcb_slip", "hcb-slip"}
+
+    def apply_booking_completion_patientwise(self, booking_id: int, updates: list[dict], actor_user_id: int) -> tuple[int, list[dict]]:
+        rows = updates or []
+        manual_patient_ids: set[int] = set()
+        completed_patient_ids: set[int] = set()
+
+        cols = self._get_table_columns("hhome_collection_booking_patient")
+
+        for raw in rows:
+            row = raw or {}
+            try:
+                pid = int(row.get("patient_id") or 0)
+            except Exception:
+                pid = 0
+            if pid <= 0:
+                continue
+
+            is_manual = self._is_manual_hcb_slip(row.get("apk_tbs"))
+            if is_manual:
+                manual_patient_ids.add(pid)
+
+            explicit_status = row.get("booking_patient_status")
+            if explicit_status is None and is_manual:
+                explicit_status = 3
+
+            if explicit_status is None:
+                continue
+
+            try:
+                bps = int(explicit_status or 0)
+            except Exception:
+                bps = 0
+
+            update_bits = ["booking_patient_status=:bps"]
+            params = {"bps": bps, "bid": int(booking_id), "pid": pid}
+
+            if is_manual and "due_amount" in cols:
+                update_bits.append("due_amount=0")
+
+            self.db.execute(
+                text(
+                    f"""
+                    UPDATE hhome_collection_booking_patient
+                    SET {', '.join(update_bits)}
+                    WHERE booking_id=:bid AND patient_id=:pid
+                    """
+                ),
+                params,
+            )
+
+            if bps == 3:
+                completed_patient_ids.add(pid)
+            if bps == 4 and pid in completed_patient_ids:
+                completed_patient_ids.remove(pid)
+
+        # Manual-slip patients are treated as complete for pending tests and patient status.
+        for pid in manual_patient_ids:
+            manual_set = ["booking_patient_status=3"]
+            if "due_amount" in cols:
+                manual_set.append("due_amount=0")
+            self.db.execute(
+                text(
+                    f"""
+                    UPDATE hhome_collection_booking_patient
+                    SET {', '.join(manual_set)}
+                    WHERE booking_id=:bid AND patient_id=:pid
+                    """
+                ),
+                {"bid": int(booking_id), "pid": pid},
+            )
+            completed_patient_ids.add(pid)
+
+        if completed_patient_ids:
+            self._update_pending_tests_status(
+                booking_id=booking_id,
+                to_status=1,
+                patient_ids=sorted(completed_patient_ids),
+            )
+
+        counts = self.get_booking_patient_status_counts(booking_id)
+        total = sum(counts.values())
+        all_completed = total > 0 and counts.get(3, 0) == total
+        has_completed = counts.get(3, 0) > 0
+        has_non_completed = total > counts.get(3, 0)
+        all_cancelled = total > 0 and counts.get(4, 0) == total
+
+        if all_completed:
+            final_status = 3
+        elif all_cancelled:
+            final_status = 4
+        elif has_completed and has_non_completed:
+            final_status = 5
+        else:
+            # Keep booking pending/assigned/start as-is when no patient completed yet.
+            cur = self.db.execute(text("SELECT booking_status FROM hhome_collection_booking WHERE id=:bid"), {"bid": int(booking_id)}).fetchone()
+            final_status = int((cur.booking_status if cur else 0) or 0)
+
+        self.db.execute(
+            text("UPDATE hhome_collection_booking SET booking_status=:st WHERE id=:bid"),
+            {"st": int(final_status), "bid": int(booking_id)},
+        )
+        self.db.commit()
+
+        patient_rows = self.get_booking_patient_status_rows(booking_id)
+        return final_status, patient_rows
+
     def handle_cancelled_patient_reschedule(self, booking_id: int, updates: list[dict], actor_user_id: int) -> None:
         booking_cols = self._get_table_columns("hhome_collection_booking")
         patient_cols = self._get_table_columns("hhome_collection_booking_patient")
@@ -2283,7 +2644,7 @@ class BookingRepository:
                 text(
                     """
                     UPDATE hhome_collection_booking_patient_test
-                    SET test_status='1', dropped_at=COALESCE(dropped_at, NOW()), dropped_by=COALESCE(dropped_by, :uid)
+                    SET test_status='2', dropped_at=COALESCE(dropped_at, NOW()), dropped_by=COALESCE(dropped_by, :uid)
                     WHERE booking_id=:bid AND patient_id=:pid AND (test_status IS NULL OR TRIM(test_status)='' OR test_status='0' OR UPPER(TRIM(test_status))='PENDING')
                     """
                 ),
@@ -2493,7 +2854,7 @@ class BookingRepository:
         )
 
     def _recompute_booking_amounts_from_active_tests(self, booking_id: int) -> None:
-        active_expr = "CASE WHEN test_status IS NULL OR TRIM(test_status)='' THEN 0 WHEN UPPER(TRIM(test_status)) IN ('PENDING','0') THEN 0 WHEN UPPER(TRIM(test_status)) IN ('DROPPED','CANCELLED','1') THEN 1 WHEN UPPER(TRIM(test_status)) IN ('COMPLETED','2') THEN 2 ELSE 0 END"
+        active_expr = "CASE WHEN test_status IS NULL OR TRIM(test_status)='' THEN 0 WHEN UPPER(TRIM(test_status)) IN ('PENDING','0') THEN 0 WHEN UPPER(TRIM(test_status)) IN ('COMPLETED','1') THEN 1 WHEN UPPER(TRIM(test_status)) IN ('DROPPED','CANCELLED','2') THEN 2 ELSE 0 END"
         rows = self.db.execute(
             text(
                 f"""
@@ -2588,6 +2949,58 @@ class BookingRepository:
             )
 
 
+
+
+    def insert_hhome_collection_batch(
+        self,
+        *,
+        batch_json: dict,
+        booking_ids: list[int],
+        patients_json: list[dict],
+        tubes_json: list[dict],
+        created_by: int,
+    ) -> int:
+        res = self.db.execute(
+            text(
+                "INSERT INTO hhome_collection_batch (batch_json, booking_ids, patients_json, tubes_json, created_by) VALUES (:batch_json, :booking_ids, :patients_json, :tubes_json, :created_by)"
+            ),
+            {
+                "batch_json": json.dumps(batch_json or {}, ensure_ascii=False),
+                "booking_ids": json.dumps([int(x) for x in (booking_ids or [])], ensure_ascii=False),
+                "patients_json": json.dumps(patients_json or [], ensure_ascii=False),
+                "tubes_json": json.dumps(tubes_json or [], ensure_ascii=False),
+                "created_by": int(created_by),
+            },
+        )
+        self.db.commit()
+        return int(getattr(res, "lastrowid", 0) or 0)
+
+    def list_hhome_collection_batch_for_user(
+        self,
+        *,
+        created_by: int,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        rows = self.db.execute(
+            text(
+                """
+                SELECT id, batch_json, booking_ids, patients_json, tubes_json, created_at
+                FROM hhome_collection_batch
+                WHERE created_by = :created_by
+                  AND created_at >= TIMESTAMP(DATE(DATE_SUB(NOW(), INTERVAL 4 HOUR)), '04:00:00')
+                  AND created_at < DATE_ADD(TIMESTAMP(DATE(DATE_SUB(NOW(), INTERVAL 4 HOUR)), '04:00:00'), INTERVAL 1 DAY)
+                ORDER BY id DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {
+                "created_by": int(created_by),
+                "limit": int(max(1, min(limit, 200))),
+                "offset": int(max(0, offset)),
+            },
+        ).mappings().all()
+        return [dict(x) for x in rows]
 
     def get_booking_address_context(self, booking_id: int) -> dict | None:
         row = self.db.execute(

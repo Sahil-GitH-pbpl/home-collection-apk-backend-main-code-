@@ -12,6 +12,8 @@ from app.repositories.booking_repository import BookingRepository
 from app.schemas.booking import (
     AddPatientToBookingRequest,
     AddPatientToBookingResponse,
+    BookingCancelRequest,
+    BookingCancelResponse,
     BookingDetailsResponse,
     BookingStatusUpdateRequest,
     BookingStatusUpdateResponse,
@@ -20,6 +22,9 @@ from app.schemas.booking import (
     EditPatientInBookingResponse,
     EditBookingAddressRequest,
     EditBookingAddressResponse,
+    BatchSaveRequest,
+    BatchSaveResponse,
+    BatchListResponse,
 )
 from app.services.booking_service import BookingService
 
@@ -73,6 +78,31 @@ def get_my_assigned_booking_details(
         catalog_db=catalog_db,
     )
 
+
+
+
+@router.post(
+    "/my-assigned/{booking_id}/cancel",
+    response_model=BookingCancelResponse,
+)
+def cancel_my_assigned_booking_direct(
+    booking_id: int,
+    payload: BookingCancelRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> BookingCancelResponse:
+    service = BookingService(repository=BookingRepository(db))
+    result = service.cancel_assigned_booking_direct(
+        booking_id=booking_id,
+        user_id=current_user.id,
+        reason_text=payload.reason_text,
+        remark=payload.remark,
+        reschedule_requested=payload.reschedule_requested,
+        proposed_visit_date=(payload.proposed_visit_date.isoformat() if payload.proposed_visit_date else None),
+        proposed_time_slot=payload.proposed_time_slot,
+        appointment_id=payload.appointment_id,
+    )
+    return BookingCancelResponse(**result)
 
 @router.post(
     "/my-assigned/{booking_id}/status",
@@ -138,6 +168,41 @@ async def update_my_assigned_booking_status(
         catalog_db=catalog_db,
         patient_documents_map=patient_documents_map,
         payment_screenshots_map=payment_screenshots_map,
+    )
+
+
+
+
+@router.get(
+    "/my-assigned/batch/history",
+    response_model=BatchListResponse,
+)
+def get_my_assigned_batch_history(
+    limit: int = 50,
+    offset: int = 0,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> BatchListResponse:
+    service = BookingService(repository=BookingRepository(db))
+    return service.get_my_batch_handover_history(
+        user_id=current_user.id,
+        limit=limit,
+        offset=offset,
+    )
+
+@router.post(
+    "/my-assigned/batch/save",
+    response_model=BatchSaveResponse,
+)
+def save_my_assigned_batch(
+    payload: BatchSaveRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> BatchSaveResponse:
+    service = BookingService(repository=BookingRepository(db))
+    return service.save_batch_handover(
+        user_id=current_user.id,
+        payload=payload,
     )
 
 

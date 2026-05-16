@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 import json
 import logging
 
@@ -25,6 +25,10 @@ from app.schemas.booking import (
     MobileBookingTestsSaveRequest,
     MobileBookingTestsSaveResponse,
     PatientDetails,
+    BatchSaveRequest,
+    BatchSaveResponse,
+    BatchListItem,
+    BatchListResponse,
 )
 
 
@@ -309,16 +313,27 @@ class BookingService:
             selected_charge_modes,
             selected_panel_companies,
             additional_discount_amount,
+            bp_prescription_files,
             patient,
         ) in patients:
             booking_patient_ids.add(int(patient.id))
             identity = panel_identity_by_name.get(self._as_str(patient.panel_company) or "")
-            patient_documents = self._split_csv_values(getattr(patient, "patient_documents", None))
-            prescription_files = self._split_csv_values(getattr(patient, "prescription_files", None))
-            patient_document_urls = [
-                f"/static/uploads/patient_documents/{name}"
-                for name in patient_documents
-            ]
+            patient_document_files = self._split_csv_values(getattr(patient, "patient_documents", None))
+            prescription_files = self._split_csv_values(bp_prescription_files)
+            patient_documents = []
+            patient_document_urls = []
+            for name in patient_document_files:
+                n = str(name)
+                u = n.upper()
+                if "_CGHS_" in u:
+                    dtype = "cghs_card"
+                elif "_PHOTO_" in u:
+                    dtype = "patient_photo"
+                else:
+                    dtype = "patient_document"
+                url = f"/static/uploads/patient_documents/{n}"
+                patient_documents.append({"file": n, "type": dtype, "url": url})
+                patient_document_urls.append(url)
             prescription_urls = [
                 f"/static/uploads/prescriptions/{name}"
                 for name in prescription_files
@@ -418,10 +433,22 @@ class BookingService:
             )
 
         normalized_action = "complete" if action == "completed" else action
+        if normalized_action == "cancel":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cancel action is not allowed on /status. Use /my-assigned/{booking_id}/cancel endpoint",
+            )
         completion_lock_acquired = False
+        global_completion_lock_acquired = False
 
         try:
             if normalized_action == "complete" and appointment_id is None:
+                global_completion_lock_acquired = self.repository.acquire_global_completion_lock(wait_timeout_sec=180)
+                if not global_completion_lock_acquired:
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail="Another booking completion is in progress. Please retry shortly",
+                    )
                 completion_lock_acquired = self.repository.acquire_booking_completion_lock(booking.id, wait_timeout_sec=120)
 
             if normalized_action == "complete" and payload is not None:
@@ -502,17 +529,22 @@ class BookingService:
 
                         prescription_files: list = []
                         patient_doc_files: list = []
+                        patient_doc_types: list[str] = []
+                        manual_hcb_files: list = []
                         for idx, f in enumerate(files):
                             dtype = doc_types[idx] if idx < len(doc_types) else ""
                             if dtype in {"cghs_card", "patient_photo"}:
                                 patient_doc_files.append(f)
+                                patient_doc_types.append(dtype)
                             elif dtype == "prescription":
                                 prescription_files.append(f)
+                            elif self._is_manual_hcb_slip(dtype):
+                                manual_hcb_files.append(f)
                             else:
                                 # Backward compatible fallback for legacy payloads.
                                 prescription_files.append(f)
 
-                        existing_prescriptions = self.repository.get_patient_prescription_paths(patient_id=patient_id)
+                        existing_prescriptions = self.repository.get_patient_prescription_paths(booking_id=booking.id, patient_id=patient_id)
                         existing_patient_docs = self.repository.get_patient_document_paths(patient_id=patient_id)
                         saved_abs_paths: list[Path] = []
                         try:
@@ -525,6 +557,7 @@ class BookingService:
                                     saved_abs_paths=saved_abs_paths,
                                 )
                                 self.repository.update_patient_prescription_files(
+                                    booking_id=booking.id,
                                     patient_id=patient_id,
                                     files=prescription_paths,
                                 )
@@ -534,17 +567,40 @@ class BookingService:
                                     files=patient_doc_files,
                                     existing_documents=existing_patient_docs,
                                     saved_abs_paths=saved_abs_paths,
+                                    file_types=patient_doc_types,
                                 )
                                 self.repository.update_patient_documents(
                                     patient_id=patient_id,
                                     documents=patient_doc_paths,
                                 )
+                            if manual_hcb_files:
+                                hcb_paths = self._save_hc_slip_files(
+                                    booking_code=booking_code,
+                                    patient_id=patient_id,
+                                    files=manual_hcb_files,
+                                )
+                                if hcb_paths:
+                                    self.repository.set_patient_payment_screenshots(
+                                        booking_id=booking.id,
+                                        patient_id=patient_id,
+                                        rel_paths=hcb_paths,
+                                    )
                         except Exception:
                             self._cleanup_saved_files(saved_abs_paths)
                             raise
 
                 if payment_screenshots_map:
                     booking_code = str(getattr(booking, "booking_code", "") or "").strip()
+                    patient_updates_by_id: dict[int, dict] = {}
+                    for row in (patient_updates or []):
+                        if not isinstance(row, dict):
+                            continue
+                        try:
+                            rid = int(row.get("patient_id") or 0)
+                        except Exception:
+                            rid = 0
+                        if rid > 0:
+                            patient_updates_by_id[rid] = row
                     for patient_id_raw, files_raw in (payment_screenshots_map or {}).items():
                         try:
                             patient_id = int(patient_id_raw)
@@ -553,10 +609,14 @@ class BookingService:
                         files = [f for f in (files_raw or []) if f is not None]
                         if patient_id <= 0 or not files:
                             continue
+                        prow = patient_updates_by_id.get(patient_id) or {}
+                        _ = prow
                         paths = self._save_payment_screenshots(
                             booking_code=booking_code,
                             patient_id=patient_id,
                             files=files,
+                            category=None,
+                            name_mode="pay",
                         )
                         if paths:
                             self.repository.set_patient_payment_screenshots(
@@ -689,10 +749,17 @@ class BookingService:
                 source_type = "APPOINTMENT"
                 detail = f"Appointment action '{normalized_action}' applied successfully"
             else:
-                final_status, patient_rows = self.repository.apply_booking_action(
-                    booking_id=booking.id,
-                    action=normalized_action,
-                )
+                if normalized_action == "complete" and payload is not None and (getattr(payload, "patient_updates", None) or []):
+                    final_status, patient_rows = self.repository.apply_booking_completion_patientwise(
+                        booking_id=booking.id,
+                        updates=(getattr(payload, "patient_updates", None) or []),
+                        actor_user_id=user_id,
+                    )
+                else:
+                    final_status, patient_rows = self.repository.apply_booking_action(
+                        booking_id=booking.id,
+                        action=normalized_action,
+                    )
                 patient_scope = "BOOKING_ALL_FALLBACK"
                 source_type = "BOOKING"
                 detail = f"Booking action '{normalized_action}' applied successfully"
@@ -704,6 +771,8 @@ class BookingService:
         finally:
             if completion_lock_acquired:
                 self.repository.release_booking_completion_lock(booking.id)
+            if global_completion_lock_acquired:
+                self.repository.release_global_completion_lock()
 
         return BookingStatusUpdateResponse(
             booking_id=booking.id,
@@ -715,6 +784,76 @@ class BookingService:
             appointment_id=appointment_id,
             patient_scope=patient_scope,
         )
+    def cancel_assigned_booking_direct(
+        self,
+        booking_id: int,
+        user_id: int,
+        reason_text: str,
+        remark: str | None = None,
+        reschedule_requested: bool = False,
+        proposed_visit_date: str | None = None,
+        proposed_time_slot: str | None = None,
+        appointment_id: int | None = None,
+    ) -> dict:
+        booking = self.repository.get_assigned_booking_by_id(
+            booking_id=booking_id,
+            user_id=user_id,
+            exclude_cancelled=False,
+        )
+        if not booking:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Booking not found or not assigned to current user",
+            )
+
+        reason = str(reason_text or "").strip()
+        if not reason:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cancel reason is required")
+
+        if reschedule_requested and (not str(proposed_visit_date or "").strip() or not str(proposed_time_slot or "").strip()):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Reschedule date and time slot are required when reschedule is requested",
+            )
+
+        try:
+            if appointment_id is not None and int(appointment_id or 0) > 0:
+                status_code, _patient_rows, _scope = self.repository.apply_appointment_action(
+                    booking_id=booking.id,
+                    appointment_id=int(appointment_id),
+                    user_id=user_id,
+                    action="cancel",
+                )
+                return {
+                    "ok": True,
+                    "booking_id": int(booking.id),
+                    "booking_status": int(status_code),
+                    "lead_created": False,
+                    "lead_id": None,
+                    "detail": "Appointment cancelled successfully",
+                }
+
+            status_code, lead_created, lead_id = self.repository.cancel_booking_with_lead(
+                booking_id=booking.id,
+                actor_user_id=user_id,
+                reason_text=reason,
+                remark=remark,
+                reschedule_requested=bool(reschedule_requested),
+                proposed_visit_date=(str(proposed_visit_date).strip() if proposed_visit_date else None),
+                proposed_time_slot=(str(proposed_time_slot).strip() if proposed_time_slot else None),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+        return {
+            "ok": True,
+            "booking_id": int(booking.id),
+            "booking_status": int(status_code),
+            "lead_created": bool(lead_created),
+            "lead_id": lead_id,
+            "detail": "Booking cancelled successfully",
+        }
+
     def add_patient_to_existing_booking(
         self,
         booking_id: int,
@@ -940,6 +1079,7 @@ class BookingService:
         files: list,
         existing_documents: list[str],
         saved_abs_paths: list[Path],
+        file_types: list[str] | None = None,
     ) -> list[str]:
         if len(existing_documents) + len(files) > self._max_documents_per_patient:
             raise HTTPException(
@@ -955,7 +1095,8 @@ class BookingService:
 
         saved_rel_paths: list[str] = list(existing_documents)
         seq = len(existing_documents) + 1
-        for file in files:
+        normalized_types = [str(t or "").strip().lower() for t in (file_types or [])]
+        for idx, file in enumerate(files):
             filename = str(getattr(file, "filename", "") or "").strip()
             ext = Path(filename).suffix.lower()
             if ext not in self._allowed_document_ext:
@@ -966,7 +1107,13 @@ class BookingService:
                     ),
                 )
 
-            out_name = f"PT{patient_id}_DOC_{seq}{ext}"
+            dtype = normalized_types[idx] if idx < len(normalized_types) else ""
+            if dtype == "cghs_card":
+                out_name = f"PT{patient_id}_CGHS_{seq}{ext}"
+            elif dtype == "patient_photo":
+                out_name = f"PT{patient_id}_PHOTO_{seq}{ext}"
+            else:
+                out_name = f"PT{patient_id}_DOC_{seq}{ext}"
             seq += 1
             out_path = base_dir / out_name
 
@@ -1039,7 +1186,11 @@ class BookingService:
 
         return saved_rel_paths
 
-    def _save_payment_screenshots(
+    def _is_manual_hcb_slip(self, value: object) -> bool:
+        v = str(value or "").strip().lower()
+        return v in {"manual hcb slip", "manual_hcb_slip", "manual hc slip", "manual_hc_slip", "manual_slip", "manual-slip", "hcb_slip", "hcb-slip"}
+
+    def _save_hc_slip_files(
         self,
         booking_code: str,
         patient_id: int,
@@ -1049,7 +1200,51 @@ class BookingService:
         if not clean_booking_code:
             return []
         web_root = Path(r"C:\Users\user\Desktop\lead_capture_project_mainss\lead_capture_project_main")
-        base_dir = web_root / "app" / "static" / "uploads" / "payment_shot" / clean_booking_code / f"PT{int(patient_id)}"
+        base_dir = web_root / "app" / "static" / "uploads" / "hc_slip" / clean_booking_code / f"PT{int(patient_id)}"
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        saved_rel_paths: list[str] = []
+        seq = 1
+        for file in (files or []):
+            filename = str(getattr(file, "filename", "") or "").strip()
+            ext = Path(filename).suffix.lower()
+            if ext not in self._allowed_document_ext:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid HC slip extension. Allowed: .pdf, .jpg, .jpeg, .png",
+                )
+            if seq == 1:
+                out_name = f"{clean_booking_code}_PT{int(patient_id)}_HC_SLIP{ext}"
+            else:
+                out_name = f"{clean_booking_code}_PT{int(patient_id)}_HC_SLIP_{seq}{ext}"
+            seq += 1
+            out_path = base_dir / out_name
+            file_obj = getattr(file, "file", None)
+            if file_obj is None:
+                continue
+            content = file_obj.read() or b""
+            out_path.write_bytes(content)
+            rel_saved = f"hc_slip/{clean_booking_code}/PT{int(patient_id)}/{out_name}"
+            saved_rel_paths.append(rel_saved)
+        return saved_rel_paths
+
+    def _save_payment_screenshots(
+        self,
+        booking_code: str,
+        patient_id: int,
+        files: list,
+        category: str | None = None,
+        name_mode: str = "pay",
+    ) -> list[str]:
+        clean_booking_code = str(booking_code or "").strip()
+        if not clean_booking_code:
+            return []
+        web_root = Path(r"C:\Users\user\Desktop\lead_capture_project_mainss\lead_capture_project_main")
+        folder = str(category or "").strip().lower()
+        if folder:
+            base_dir = web_root / "app" / "static" / "uploads" / "payment_shot" / folder / clean_booking_code / f"PT{int(patient_id)}"
+        else:
+            base_dir = web_root / "app" / "static" / "uploads" / "payment_shot" / clean_booking_code / f"PT{int(patient_id)}"
         base_dir.mkdir(parents=True, exist_ok=True)
 
         saved_rel_paths: list[str] = []
@@ -1062,7 +1257,14 @@ class BookingService:
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Invalid payment screenshot extension. Allowed: .pdf, .jpg, .jpeg, .png",
                 )
-            out_name = f"{clean_booking_code}_PT{int(patient_id)}_PAY_{seq}{ext}"
+            mode = str(name_mode or "pay").strip().lower()
+            if mode == "hc_slip":
+                if seq == 1:
+                    out_name = f"{clean_booking_code}_PT{int(patient_id)}_HC_SLIP{ext}"
+                else:
+                    out_name = f"{clean_booking_code}_PT{int(patient_id)}_HC_SLIP_{seq}{ext}"
+            else:
+                out_name = f"{clean_booking_code}_PT{int(patient_id)}_PAY_{seq}{ext}"
             seq += 1
             out_path = base_dir / out_name
             file_obj = getattr(file, "file", None)
@@ -1070,7 +1272,10 @@ class BookingService:
                 continue
             content = file_obj.read() or b""
             out_path.write_bytes(content)
-            rel_saved = f"{clean_booking_code}/PT{int(patient_id)}/{out_name}"
+            if folder:
+                rel_saved = f"{folder}/{clean_booking_code}/PT{int(patient_id)}/{out_name}"
+            else:
+                rel_saved = f"{clean_booking_code}/PT{int(patient_id)}/{out_name}"
             saved_rel_paths.append(rel_saved)
         return saved_rel_paths
 
@@ -1366,6 +1571,99 @@ class BookingService:
 
 
 
+
+    def get_my_batch_handover_history(
+        self,
+        *,
+        user_id: int,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> BatchListResponse:
+        rows = self.repository.list_hhome_collection_batch_for_user(
+            created_by=user_id,
+            limit=limit,
+            offset=offset,
+        )
+
+        items: list[BatchListItem] = []
+        for row in rows:
+            try:
+                batch = json.loads(str(row.get("batch_json") or "{}"))
+            except Exception:
+                batch = {}
+            try:
+                booking_ids = json.loads(str(row.get("booking_ids") or "[]"))
+            except Exception:
+                booking_ids = []
+            try:
+                patients = json.loads(str(row.get("patients_json") or "[]"))
+            except Exception:
+                patients = []
+            try:
+                tubes = json.loads(str(row.get("tubes_json") or "[]"))
+            except Exception:
+                tubes = []
+            created_at = row.get("created_at")
+            items.append(
+                BatchListItem(
+                    id=int(row.get("id") or 0),
+                    batch=batch if isinstance(batch, dict) else {},
+                    booking_ids=[int(x) for x in (booking_ids or []) if str(x).strip().isdigit()],
+                    patients=patients if isinstance(patients, list) else [],
+                    tubes=tubes if isinstance(tubes, list) else [],
+                    created_at=str(created_at) if created_at is not None else None,
+                )
+            )
+
+        return BatchListResponse(items=items)
+
+    def save_batch_handover(
+        self,
+        *,
+        user_id: int,
+        payload: BatchSaveRequest,
+    ) -> BatchSaveResponse:
+        batch_meta = payload.batch.model_dump() if payload.batch else {}
+        booking_ids: list[int] = []
+        patients_rows: list[dict] = []
+        tubes_rows: list[dict] = []
+
+        for b in (payload.bookings or []):
+            bid = int(b.booking_id)
+            booking_ids.append(bid)
+            for p in (b.patients or []):
+                pid = int(p.patient_id)
+                bpid = int(p.booking_patient_id)
+                pname = (p.patient_name or "").strip() or None
+                patients_rows.append({
+                    "booking_id": bid,
+                    "booking_code": b.booking_code,
+                    "patient_id": pid,
+                    "booking_patient_id": bpid,
+                    "patient_name": pname,
+                })
+                for t in (p.tubes or []):
+                    tname = (t.tube_name or "").strip()
+                    if not tname:
+                        continue
+                    tubes_rows.append({
+                        "booking_id": bid,
+                        "booking_code": b.booking_code,
+                        "patient_id": pid,
+                        "booking_patient_id": bpid,
+                        "patient_name": pname,
+                        "tube_name": tname,
+                    })
+
+        batch_id = self.repository.insert_hhome_collection_batch(
+            batch_json=batch_meta,
+            booking_ids=sorted(set(booking_ids)),
+            patients_json=patients_rows,
+            tubes_json=tubes_rows,
+            created_by=int(user_id),
+        )
+        return BatchSaveResponse(ok=True, batch_id=int(batch_id), detail="Batch saved successfully")
+
     def edit_booking_address(
         self,
         booking_id: int,
@@ -1433,3 +1731,4 @@ class BookingService:
             message="Address updated successfully",
             address=AddressDetails.model_validate(updated),
         )
+

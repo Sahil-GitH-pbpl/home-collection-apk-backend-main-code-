@@ -1,4 +1,4 @@
-﻿from datetime import date
+from datetime import date
 from typing import Optional
 
 from sqlalchemy import Date, Integer, Numeric, String, Text
@@ -38,6 +38,7 @@ class HomeCollectionBookingPatient(Base):
     selected_comp_cat_ids: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     selected_charge_modes: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     selected_panel_companies: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    prescription_files: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     additional_discount_amount: Mapped[Optional[float]] = mapped_column("additional_discount_amount", Numeric(12, 2), nullable=True)
 
 
@@ -77,7 +78,6 @@ class PatientMaster(Base):
     card_no: Mapped[Optional[str]] = mapped_column("card_number", String(100), nullable=True)
     tag: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     patient_documents: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    prescription_files: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class AddressMaster(Base):
@@ -95,6 +95,7 @@ class AddressMaster(Base):
     route_no_snapshot: Mapped[Optional[str]] = mapped_column("route_no", String(100), nullable=True)
     city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     access_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
 
 
 

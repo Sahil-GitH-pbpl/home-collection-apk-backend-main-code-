@@ -78,7 +78,7 @@ class PatientDetails(BaseModel):
     selected_panel_companies: str | None = None
     additional_discount_amount: float | None = None
     tag: str | None = None
-    patient_documents: list[str] = Field(default_factory=list)
+    patient_documents: list[dict] = Field(default_factory=list)
     patient_document_urls: list[str] = Field(default_factory=list)
     prescription_files: list[str] = Field(default_factory=list)
     prescription_urls: list[str] = Field(default_factory=list)
@@ -116,7 +116,7 @@ class BookingDetailsResponse(BaseModel):
 
 
 class BookingStatusUpdateRequest(BaseModel):
-    action: Literal["assign", "start", "cancel", "complete", "completed"]
+    action: Literal["assign", "start", "stop", "complete", "completed"]
     appointment_id: int | None = None
     additional_discount_mode: str | None = None
     additional_discount_value: float | None = None
@@ -138,13 +138,32 @@ class BookingPatientStatusItem(BaseModel):
 class BookingStatusUpdateResponse(BaseModel):
     booking_id: int
     booking_status: int
-    action: Literal["assign", "start", "cancel", "complete", "completed"]
+    action: Literal["assign", "start", "stop", "complete", "completed"]
     patients: list[BookingPatientStatusItem]
     detail: str
     source_type: Literal["BOOKING", "APPOINTMENT"] = "BOOKING"
     appointment_id: int | None = None
     patient_scope: Literal["APPOINTMENT_SELECTED", "BOOKING_ALL_FALLBACK"] = "BOOKING_ALL_FALLBACK"
 
+
+
+
+class BookingCancelRequest(BaseModel):
+    appointment_id: int | None = None
+    reason_text: str
+    remark: str | None = None
+    reschedule_requested: bool = False
+    proposed_visit_date: date | None = None
+    proposed_time_slot: str | None = None
+
+
+class BookingCancelResponse(BaseModel):
+    ok: bool = True
+    booking_id: int
+    booking_status: int
+    lead_created: bool = False
+    lead_id: str | None = None
+    detail: str
 
 class AddPatientToBookingRequest(BaseModel):
     existing_patient_id: int | None = None
@@ -280,3 +299,53 @@ class MobileBookingTestsSaveResponse(BaseModel):
 
 
 
+
+
+class BatchTubeItem(BaseModel):
+    tube_name: str
+
+
+class BatchPatientItem(BaseModel):
+    patient_id: int
+    booking_patient_id: int
+    patient_name: str | None = None
+    tubes: list[BatchTubeItem] = Field(default_factory=list)
+
+
+class BatchBookingItem(BaseModel):
+    booking_id: int
+    booking_code: str | None = None
+    patients: list[BatchPatientItem] = Field(default_factory=list)
+
+
+class BatchMetaPayload(BaseModel):
+    handover_to: str | None = None
+    rider_name: str | None = None
+    handed_over_at: str | None = None
+    booking_count: int | None = None
+    patient_count: int | None = None
+    tube_count: int | None = None
+
+
+class BatchSaveRequest(BaseModel):
+    batch: BatchMetaPayload
+    bookings: list[BatchBookingItem] = Field(default_factory=list)
+
+
+class BatchSaveResponse(BaseModel):
+    ok: bool = True
+    batch_id: int
+    detail: str
+
+
+class BatchListItem(BaseModel):
+    id: int
+    batch: dict = Field(default_factory=dict)
+    booking_ids: list[int] = Field(default_factory=list)
+    patients: list[dict] = Field(default_factory=list)
+    tubes: list[dict] = Field(default_factory=list)
+    created_at: str | None = None
+
+
+class BatchListResponse(BaseModel):
+    items: list[BatchListItem] = Field(default_factory=list)
