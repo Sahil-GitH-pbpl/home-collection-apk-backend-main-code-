@@ -16,7 +16,29 @@ class SyncPage:
 
 
 class SyncRepository:
-    ACTIVE_FILTER_TABLES = {"panelrates"}
+    ACTIVE_FILTER_TABLES = {"address", "panelrates"}
+    _CURSOR_KEY_ALIAS = "__sync_cursor_key"
+    _ADDRESS_CURSOR_COLUMNS = (
+        "CenterID",
+        "Atype",
+        "code",
+        "ABARID",
+        "pname",
+        "desi",
+        "orgname",
+        "address",
+        "address1",
+        "address2",
+        "city",
+        "pin",
+        "area",
+        "Omobile",
+        "category",
+        "Aprint",
+        "title",
+        "email",
+        "BillingChargeMode",
+    )
 
     def __init__(self, db: Session, database_name: str) -> None:
         self.db = db
@@ -123,6 +145,15 @@ class SyncRepository:
                 return found
         return columns[0]
 
+    def _get_cursor_key_expression(self, table_name: str, fallback_column: str) -> str:
+        if table_name == "address":
+            parts = [
+                f"COALESCE(CAST(`{column}` AS CHAR), '<NULL>')"
+                for column in self._ADDRESS_CURSOR_COLUMNS
+            ]
+            return f"CONCAT_WS('|', {', '.join(parts)})"
+        return f"CAST(`{fallback_column}` AS CHAR)"
+
     def fetch_incremental(
         self,
         table_name: str,
@@ -137,6 +168,8 @@ class SyncRepository:
         tie_breaker_col = pk_col or self._get_fallback_order_column(table_name)
         if not tie_breaker_col:
             raise ValueError(f"No usable ordering column found for table '{table_name}'")
+        cursor_key_expr = self._get_cursor_key_expression(table_name, tie_breaker_col)
+        cursor_key_alias = self._CURSOR_KEY_ALIAS
 
         params: dict[str, Any] = {"since": since, "limit_plus": limit + 1}
         active_col = self._get_active_flag_column(table_name)
@@ -146,16 +179,16 @@ class SyncRepository:
                 where_parts.append(f"`{active_col}` = 1")
             if cursor_updated_at is not None and cursor_pk_value is not None:
                 where_parts.append(
-                    f"(`{incremental_col}` > :cursor_updated_at OR (`{incremental_col}` = :cursor_updated_at AND CAST(`{tie_breaker_col}` AS CHAR) > :cursor_pk_value))"
+                    f"(`{incremental_col}` > :cursor_updated_at OR (`{incremental_col}` = :cursor_updated_at AND {cursor_key_expr} > :cursor_pk_value))"
                 )
                 params["cursor_updated_at"] = cursor_updated_at
                 params["cursor_pk_value"] = cursor_pk_value
             query = text(
                 f"""
-                SELECT *
+                SELECT *, {cursor_key_expr} AS `{cursor_key_alias}`
                 FROM `{table_name}`
                 WHERE {' AND '.join(where_parts)}
-                ORDER BY `{incremental_col}` ASC, CAST(`{tie_breaker_col}` AS CHAR) ASC
+                ORDER BY `{incremental_col}` ASC, {cursor_key_expr} ASC
                 LIMIT :limit_plus
                 """
             )
@@ -164,15 +197,15 @@ class SyncRepository:
             if active_col:
                 where_parts.append(f"`{active_col}` = 1")
             if cursor_pk_value is not None:
-                where_parts.append(f"CAST(`{tie_breaker_col}` AS CHAR) > :cursor_pk_value")
+                where_parts.append(f"{cursor_key_expr} > :cursor_pk_value")
                 params["cursor_pk_value"] = cursor_pk_value
             where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
             query = text(
                 f"""
-                SELECT *
+                SELECT *, {cursor_key_expr} AS `{cursor_key_alias}`
                 FROM `{table_name}`
                 {where_sql}
-                ORDER BY CAST(`{tie_breaker_col}` AS CHAR) ASC
+                ORDER BY {cursor_key_expr} ASC
                 LIMIT :limit_plus
                 """
             )
@@ -180,12 +213,16 @@ class SyncRepository:
 
         has_more = len(rows) > limit
         page_rows = rows[:limit]
-        items = [dict(row) for row in page_rows]
+        items = []
+        for row in page_rows:
+            item = dict(row)
+            item.pop(cursor_key_alias, None)
+            items.append(item)
 
         next_cursor: str | None = None
         if has_more and page_rows:
             last = page_rows[-1]
-            pk_value = last.get(tie_breaker_col)
+            pk_value = last.get(cursor_key_alias)
             if incremental_col:
                 updated_at = last.get(incremental_col)
                 if updated_at is not None and pk_value is not None:

@@ -1,8 +1,10 @@
-﻿import json
+import json
 from datetime import datetime, time, timedelta
 from collections import defaultdict
+from threading import Lock
 from typing import Sequence
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import bindparam, func
 from sqlalchemy import text
@@ -18,28 +20,36 @@ from app.models.booking import (
 
 class BookingRepository:
     _appointment_index_ensured: bool = False
+    _shared_table_columns_cache: dict[str, set[str]] = {}
+    _shared_table_columns_lock = Lock()
+    _ist_tz = ZoneInfo("Asia/Kolkata")
 
     def __init__(self, db: Session) -> None:
         self.db = db
-        self._table_columns_cache: dict[str, set[str]] = {}
 
     def _get_table_columns(self, table_name: str) -> set[str]:
-        if table_name in self._table_columns_cache:
-            return self._table_columns_cache[table_name]
         if table_name not in {
             "haddress_master",
             "hcaller_master",
             "hhome_collection_booking",
             "hhome_collection_booking_appointment",
+            "hhome_collection_batch",
             "hhome_collection_booking_patient",
             "hhome_collection_booking_patient_test",
             "hpatient_master",
         }:
             raise ValueError(f"Unsupported table name: {table_name}")
-        rows = self.db.execute(text(f"SHOW COLUMNS FROM {table_name}")).fetchall()
-        columns = {str(row.Field) for row in rows}
-        self._table_columns_cache[table_name] = columns
-        return columns
+        cached_columns = BookingRepository._shared_table_columns_cache.get(table_name)
+        if cached_columns is not None:
+            return cached_columns
+        with BookingRepository._shared_table_columns_lock:
+            cached_columns = BookingRepository._shared_table_columns_cache.get(table_name)
+            if cached_columns is not None:
+                return cached_columns
+            rows = self.db.execute(text(f"SHOW COLUMNS FROM {table_name}")).fetchall()
+            columns = {str(row.Field) for row in rows}
+            BookingRepository._shared_table_columns_cache[table_name] = columns
+            return columns
 
     def get_my_assigned_bookings(
         self,
@@ -473,7 +483,11 @@ class BookingRepository:
         if visit_date is None:
             return False
         if now_dt is None:
-            now_dt = datetime.now()
+            now_dt = datetime.now(BookingRepository._ist_tz)
+        elif now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=BookingRepository._ist_tz)
+        else:
+            now_dt = now_dt.astimezone(BookingRepository._ist_tz)
         if hasattr(visit_date, 'year') and hasattr(visit_date, 'month') and hasattr(visit_date, 'day'):
             d = visit_date
         else:
@@ -481,9 +495,21 @@ class BookingRepository:
                 d = datetime.strptime(str(visit_date), "%Y-%m-%d").date()
             except Exception:
                 return False
-        start_dt = datetime.combine(d, time(4, 0, 0))
+        start_dt = datetime.combine(d, time(4, 0, 0), tzinfo=BookingRepository._ist_tz)
         end_dt = start_dt + timedelta(days=1)
         return start_dt <= now_dt < end_dt
+
+    @staticmethod
+    def _current_assigned_visit_date(now_dt: datetime | None = None):
+        if now_dt is None:
+            current_dt = datetime.now(BookingRepository._ist_tz)
+        elif now_dt.tzinfo is None:
+            current_dt = now_dt.replace(tzinfo=BookingRepository._ist_tz)
+        else:
+            current_dt = now_dt.astimezone(BookingRepository._ist_tz)
+        if current_dt.time() < time(4, 0, 0):
+            return (current_dt - timedelta(days=1)).date()
+        return current_dt.date()
 
     def get_my_assigned_merged(
         self,
@@ -493,53 +519,219 @@ class BookingRepository:
         limit: int,
         offset: int,
     ) -> list[dict]:
-        booking_rows = self.get_my_assigned_bookings(
-            user_id=user_id,
-            exclude_cancelled=not include_terminal,
-            status_filter=status_filter,
-        )
-        booking_items = [
-            {
-                "source_type": "BOOKING",
-                "id": int(row.id),
-                "booking_id": int(row.id),
-                "appointment_id": None,
-                "appointment_no": None,
-                "booking_status": self._to_int(row.booking_status),
-                "preferred_visit_date": row.preferred_visit_date,
-                "preferred_time_slot": row.preferred_time_slot,
-                "caller_mobile": row.caller_mobile,
-                "patient_count": int(row.patient_count or 0),
-                "patient_scope": "BOOKING_ALL_FALLBACK",
-                "route": self._colony_name_from_snapshot(getattr(row, "address_snapshot_json", None)),
-            }
-            for row in booking_rows
+        appointment_cols = self._get_appointment_columns()
+        target_visit_date = self._current_assigned_visit_date()
+        status_values = [
+            self._to_int(value)
+            for value in (status_filter or [])
+            if self._to_int(value) is not None
         ]
-        appointment_items = self.get_my_assigned_appointments(
-            user_id=user_id,
-            status_filter=status_filter,
-            include_terminal=include_terminal,
+        booking_status_sql = ""
+        appointment_status_sql = ""
+        params: dict[str, object] = {
+            "user_id": user_id,
+            "target_visit_date": target_visit_date,
+            "limit": max(1, int(limit)),
+            "offset": max(0, int(offset)),
+        }
+        appointment_id_col = "id" if "id" in appointment_cols else "appointment_id"
+        appointment_route_sql = (
+            "COALESCE(a.route_no, '')"
+            if "route_no" in appointment_cols
+            else ("COALESCE(a.route, '')" if "route" in appointment_cols else "''")
         )
-        merged = booking_items + appointment_items
-        now_dt = datetime.now()
-        merged = [
-            item for item in merged
-            if self._within_4am_window_for_date(item.get("preferred_visit_date"), now_dt=now_dt)
-        ]
-        booking_ids_for_names = [int(item.get("booking_id")) for item in merged if self._to_int(item.get("booking_id"))]
-        names_map = self.get_patient_names_by_booking_ids(booking_ids_for_names)
-        for item in merged:
-            bid = self._to_int(item.get("booking_id"))
-            item["patient_names"] = names_map.get(bid) if bid is not None else None
+        appointment_slot_col = (
+            "preferred_time_slot"
+            if "preferred_time_slot" in appointment_cols
+            else ("preferred_slot" if "preferred_slot" in appointment_cols else None)
+        )
+        appointment_date_col = (
+            "preferred_visit_date"
+            if "preferred_visit_date" in appointment_cols
+            else ("visit_date" if "visit_date" in appointment_cols else None)
+        )
+        if status_values:
+            status_placeholders: list[str] = []
+            for index, status_value in enumerate(status_values):
+                key = f"status_{index}"
+                params[key] = status_value
+                status_placeholders.append(f":{key}")
+            status_sql = ", ".join(status_placeholders)
+            booking_status_sql = f" AND b.booking_status IN ({status_sql})"
+            if "appointment_status" in appointment_cols:
+                appointment_status_sql = f" AND a.appointment_status IN ({status_sql})"
+        if not include_terminal:
+            booking_status_sql += " AND b.booking_status != 3"
+            if "appointment_status" in appointment_cols:
+                appointment_status_sql += " AND COALESCE(a.appointment_status, 0) NOT IN (3, 4, 5)"
 
-        merged.sort(
-            key=lambda x: (
-                x.get("preferred_visit_date") is None,
-                x.get("preferred_visit_date"),
-                str(x.get("preferred_time_slot") or ""),
-            )
+        appointment_query = """
+                SELECT
+                    'APPOINTMENT' AS source_type,
+                    a.booking_id AS id,
+                    a.booking_id AS booking_id,
+                    a.{appointment_id_col} AS appointment_id,
+                    a.appointment_no AS appointment_no,
+                    COALESCE(a.appointment_status, 0) AS booking_status,
+                    a.{appointment_date_col} AS preferred_visit_date,
+                    a.{appointment_slot_col} AS preferred_time_slot,
+                    c.primary_mobile AS caller_mobile,
+                    CASE
+                        WHEN JSON_VALID(a.selected_patient_ids_json) AND JSON_LENGTH(a.selected_patient_ids_json) > 0
+                            THEN JSON_LENGTH(a.selected_patient_ids_json)
+                        ELSE COUNT(DISTINCT bp.patient_id)
+                    END AS patient_count,
+                    CASE
+                        WHEN JSON_VALID(a.selected_patient_ids_json) AND JSON_LENGTH(a.selected_patient_ids_json) > 0
+                            THEN 'APPOINTMENT_SELECTED'
+                        ELSE 'BOOKING_ALL_FALLBACK'
+                    END AS patient_scope,
+                    {appointment_route_sql} AS route,
+                    GROUP_CONCAT(
+                        DISTINCT TRIM(CONCAT(COALESCE(p.title, ''), ' ', COALESCE(p.full_name, '')))
+                        ORDER BY bp.id, p.id
+                        SEPARATOR ', '
+                    ) AS patient_names
+                FROM hhome_collection_booking_appointment a
+                LEFT JOIN hhome_collection_booking b ON b.id = a.booking_id
+                LEFT JOIN hcaller_master c ON c.id = b.caller_id
+                LEFT JOIN hhome_collection_booking_patient bp ON bp.booking_id = a.booking_id
+                LEFT JOIN hpatient_master p ON p.id = bp.patient_id
+                WHERE a.assigned_phlebotomist_id = :user_id
+                  AND a.{appointment_date_col} = :target_visit_date
+                  {appointment_status_sql}
+                GROUP BY
+                    a.booking_id,
+                    a.{appointment_id_col},
+                    a.appointment_no,
+                    a.appointment_status,
+                    a.selected_patient_ids_json,
+                    a.{appointment_date_col},
+                    a.{appointment_slot_col},
+                    route,
+                    c.primary_mobile
+        """.format(
+            appointment_id_col=appointment_id_col,
+            appointment_date_col=appointment_date_col,
+            appointment_slot_col=appointment_slot_col,
+            appointment_route_sql=appointment_route_sql,
+            appointment_status_sql=appointment_status_sql,
         )
-        return merged[offset : offset + limit]
+        if "assigned_phlebotomist_id" not in appointment_cols or "booking_id" not in appointment_cols:
+            appointment_query = """
+                SELECT
+                    'APPOINTMENT' AS source_type,
+                    NULL AS id,
+                    NULL AS booking_id,
+                    NULL AS appointment_id,
+                    NULL AS appointment_no,
+                    NULL AS booking_status,
+                    NULL AS preferred_visit_date,
+                    NULL AS preferred_time_slot,
+                    NULL AS caller_mobile,
+                    0 AS patient_count,
+                    'BOOKING_ALL_FALLBACK' AS patient_scope,
+                    '' AS route,
+                    NULL AS patient_names
+                WHERE 1 = 0
+            """
+        elif appointment_date_col is None or appointment_slot_col is None:
+            appointment_query = """
+                SELECT
+                    'APPOINTMENT' AS source_type,
+                    NULL AS id,
+                    NULL AS booking_id,
+                    NULL AS appointment_id,
+                    NULL AS appointment_no,
+                    NULL AS booking_status,
+                    NULL AS preferred_visit_date,
+                    NULL AS preferred_time_slot,
+                    NULL AS caller_mobile,
+                    0 AS patient_count,
+                    'BOOKING_ALL_FALLBACK' AS patient_scope,
+                    '' AS route,
+                    NULL AS patient_names
+                WHERE 1 = 0
+            """
+
+        rows = self.db.execute(
+            text(
+                f"""
+                SELECT *
+                FROM (
+                    SELECT
+                        'BOOKING' AS source_type,
+                        b.id AS id,
+                        b.id AS booking_id,
+                        NULL AS appointment_id,
+                        NULL AS appointment_no,
+                        b.booking_status AS booking_status,
+                        b.preferred_visit_date AS preferred_visit_date,
+                        b.preferred_time_slot AS preferred_time_slot,
+                        c.primary_mobile AS caller_mobile,
+                        COUNT(DISTINCT bp.patient_id) AS patient_count,
+                        'BOOKING_ALL_FALLBACK' AS patient_scope,
+                        CASE
+                            WHEN JSON_VALID(b.address_snapshot_json)
+                                THEN COALESCE(
+                                    JSON_UNQUOTE(JSON_EXTRACT(b.address_snapshot_json, '$.colony_name_snapshot')),
+                                    JSON_UNQUOTE(JSON_EXTRACT(b.address_snapshot_json, '$.colony_name')),
+                                    ''
+                                )
+                            ELSE ''
+                        END AS route,
+                        GROUP_CONCAT(
+                            DISTINCT TRIM(CONCAT(COALESCE(p.title, ''), ' ', COALESCE(p.full_name, '')))
+                            ORDER BY bp.id, p.id
+                            SEPARATOR ', '
+                        ) AS patient_names
+                    FROM hhome_collection_booking b
+                    LEFT JOIN hcaller_master c ON c.id = b.caller_id
+                    LEFT JOIN hhome_collection_booking_patient bp ON bp.booking_id = b.id
+                    LEFT JOIN hpatient_master p ON p.id = bp.patient_id
+                    WHERE b.assigned_phlebotomist_id = :user_id
+                      AND b.preferred_visit_date = :target_visit_date
+                      {booking_status_sql}
+                    GROUP BY
+                        b.id,
+                        b.booking_status,
+                        b.preferred_visit_date,
+                        b.preferred_time_slot,
+                        c.primary_mobile,
+                        route
+
+                    UNION ALL
+
+                    {appointment_query}
+                ) merged
+                ORDER BY
+                    merged.preferred_visit_date ASC,
+                    merged.preferred_time_slot ASC,
+                    merged.booking_id ASC,
+                    merged.appointment_id ASC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            params,
+        ).mappings().all()
+        return [
+            {
+                "source_type": str(row.get("source_type") or "BOOKING"),
+                "id": self._to_int(row.get("id")),
+                "booking_id": self._to_int(row.get("booking_id")),
+                "appointment_id": self._to_int(row.get("appointment_id")),
+                "appointment_no": row.get("appointment_no"),
+                "booking_status": self._normalize_status_code(row.get("booking_status")),
+                "preferred_visit_date": row.get("preferred_visit_date"),
+                "preferred_time_slot": row.get("preferred_time_slot"),
+                "caller_mobile": row.get("caller_mobile"),
+                "patient_count": int(row.get("patient_count") or 0),
+                "patient_scope": str(row.get("patient_scope") or "BOOKING_ALL_FALLBACK"),
+                "route": str(row.get("route") or "").strip() or None,
+                "patient_names": str(row.get("patient_names") or "").strip() or None,
+            }
+            for row in rows
+        ]
 
     def get_assigned_booking_by_id(
         self, booking_id: int, user_id: int, exclude_cancelled: bool = True
@@ -558,7 +750,102 @@ class BookingRepository:
     def get_caller(self, caller_id: int | None) -> CallerMaster | None:
         if not caller_id:
             return None
-        return self.db.query(CallerMaster).filter(CallerMaster.id == caller_id).first()
+
+    @staticmethod
+    def _clean_text(value: object) -> str | None:
+        text_value = str(value or "").strip()
+        return text_value or None
+
+    def _apply_booking_lifecycle_fields(
+        self,
+        *,
+        booking_id: int,
+        action: str,
+        start_time: str | None = None,
+        start_location: str | None = None,
+        complete_time: str | None = None,
+        complete_location: str | None = None,
+    ) -> None:
+        cols = self._get_table_columns("hhome_collection_booking")
+        sets: list[str] = []
+        params: dict[str, object] = {"booking_id": int(booking_id)}
+
+        if action == "start":
+            if "start_time" in cols and self._clean_text(start_time):
+                sets.append("start_time=:start_time")
+                params["start_time"] = self._clean_text(start_time)
+            if "start_location" in cols and self._clean_text(start_location):
+                sets.append("start_location=:start_location")
+                params["start_location"] = self._clean_text(start_location)
+        elif action in {"complete", "cancel"}:
+            if "complete_time" in cols and self._clean_text(complete_time):
+                sets.append("complete_time=:complete_time")
+                params["complete_time"] = self._clean_text(complete_time)
+            if "complete_location" in cols and self._clean_text(complete_location):
+                sets.append("complete_location=:complete_location")
+                params["complete_location"] = self._clean_text(complete_location)
+
+        if sets:
+            self.db.execute(
+                text(
+                    f"""
+                    UPDATE hhome_collection_booking
+                    SET {', '.join(sets)}
+                    WHERE id=:booking_id
+                    """
+                ),
+                params,
+            )
+
+    def _apply_appointment_lifecycle_fields(
+        self,
+        *,
+        appointment_id: int,
+        booking_id: int,
+        action: str,
+        start_time: str | None = None,
+        start_location: str | None = None,
+        complete_time: str | None = None,
+        complete_location: str | None = None,
+    ) -> None:
+        cols = self._get_appointment_columns()
+        if not cols:
+            return
+        id_col = "id" if "id" in cols else "appointment_id"
+        sets: list[str] = []
+        params: dict[str, object] = {
+            "appointment_id": int(appointment_id),
+            "booking_id": int(booking_id),
+        }
+
+        if action == "start":
+            if "start_time" in cols and self._clean_text(start_time):
+                sets.append("start_time=:start_time")
+                params["start_time"] = self._clean_text(start_time)
+            if "start_location" in cols and self._clean_text(start_location):
+                sets.append("start_location=:start_location")
+                params["start_location"] = self._clean_text(start_location)
+        elif action in {"complete", "cancel"}:
+            if "complete_time" in cols and self._clean_text(complete_time):
+                sets.append("complete_time=:complete_time")
+                params["complete_time"] = self._clean_text(complete_time)
+            if "complete_location" in cols and self._clean_text(complete_location):
+                sets.append("complete_location=:complete_location")
+                params["complete_location"] = self._clean_text(complete_location)
+
+        if sets:
+            self.db.execute(
+                text(
+                    f"""
+                    UPDATE hhome_collection_booking_appointment
+                    SET {', '.join(sets)}
+                    WHERE {id_col}=:appointment_id
+                      AND booking_id=:booking_id
+                    """
+                ),
+                params,
+            )
+
 
     def get_address(self, address_id: int | None) -> dict | None:
         if not address_id:
@@ -611,6 +898,7 @@ class BookingRepository:
                 HomeCollectionBookingPatient.booking_patient_status,
                 HomeCollectionBookingPatient.cce_level_TBS,
                 HomeCollectionBookingPatient.selected_comp_cat_ids,
+                HomeCollectionBookingPatient.referred_by,
                 HomeCollectionBookingPatient.selected_charge_modes,
                 HomeCollectionBookingPatient.selected_panel_companies,
                 HomeCollectionBookingPatient.additional_discount_amount,
@@ -1008,7 +1296,15 @@ class BookingRepository:
         ).fetchone()
         return bool(row)
 
-    def apply_booking_action(self, booking_id: int, action: str) -> tuple[int, list[dict]]:
+    def apply_booking_action(
+        self,
+        booking_id: int,
+        action: str,
+        start_time: str | None = None,
+        start_location: str | None = None,
+        complete_time: str | None = None,
+        complete_location: str | None = None,
+    ) -> tuple[int, list[dict]]:
         action = "complete" if action == "completed" else action
         try:
             booking_row = self.db.execute(
@@ -1187,6 +1483,14 @@ class BookingRepository:
                 final_status = 4
             else:
                 raise ValueError(f"Unsupported action '{action}'")
+            self._apply_booking_lifecycle_fields(
+                booking_id=int(booking_id),
+                action=action,
+                start_time=start_time,
+                start_location=start_location,
+                complete_time=complete_time,
+                complete_location=complete_location,
+            )
             self.db.commit()
         except Exception:
             self.db.rollback()
@@ -1228,6 +1532,8 @@ class BookingRepository:
         actor_user_id: int,
         reason_text: str,
         remark: str | None = None,
+        complete_time: str | None = None,
+        complete_location: str | None = None,
         reschedule_requested: bool = False,
         proposed_visit_date: str | None = None,
         proposed_time_slot: str | None = None,
@@ -1273,6 +1579,12 @@ class BookingRepository:
         self._update_pending_tests_status(
             booking_id=int(booking_id),
             to_status=2,
+        )
+        self._apply_booking_lifecycle_fields(
+            booking_id=int(booking_id),
+            action="cancel",
+            complete_time=complete_time,
+            complete_location=complete_location,
         )
 
         lead_created = False
@@ -1367,6 +1679,10 @@ class BookingRepository:
         appointment_id: int,
         user_id: int,
         action: str,
+        start_time: str | None = None,
+        start_location: str | None = None,
+        complete_time: str | None = None,
+        complete_location: str | None = None,
     ) -> tuple[int, list[dict], str]:
         action = "complete" if action == "completed" else action
         cols = self._get_appointment_columns()
@@ -1448,6 +1764,15 @@ class BookingRepository:
                     "appointment_id": appointment_id,
                     "booking_id": booking_id,
                 },
+            )
+            self._apply_appointment_lifecycle_fields(
+                appointment_id=int(appointment_id),
+                booking_id=int(booking_id),
+                action=action,
+                start_time=start_time,
+                start_location=start_location,
+                complete_time=complete_time,
+                complete_location=complete_location,
             )
 
             if action == "complete":
@@ -2199,6 +2524,45 @@ class BookingRepository:
             {"prescription_files": csv_value, "booking_id": int(booking_id), "patient_id": int(patient_id)},
         )
 
+    def get_patient_photo_paths(self, booking_id: int, patient_id: int) -> list[str]:
+        cols = self._get_table_columns("hhome_collection_booking_patient")
+        if "patient_photo_files" not in cols:
+            return []
+        row = self.db.execute(
+            text(
+                """
+                SELECT patient_photo_files
+                FROM hhome_collection_booking_patient
+                WHERE booking_id = :booking_id AND patient_id = :patient_id
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ),
+            {"booking_id": int(booking_id), "patient_id": int(patient_id)},
+        ).fetchone()
+        if not row or row.patient_photo_files is None:
+            return []
+        raw = str(row.patient_photo_files).strip()
+        if not raw:
+            return []
+        return [x.strip() for x in raw.split(",") if x.strip()]
+
+    def update_patient_photo_files(self, booking_id: int, patient_id: int, files: list[str]) -> None:
+        cols = self._get_table_columns("hhome_collection_booking_patient")
+        if "patient_photo_files" not in cols:
+            return
+        csv_value = ",".join(files)
+        self.db.execute(
+            text(
+                """
+                UPDATE hhome_collection_booking_patient
+                SET patient_photo_files = :patient_photo_files
+                WHERE booking_id = :booking_id AND patient_id = :patient_id
+                """
+            ),
+            {"patient_photo_files": csv_value or None, "booking_id": int(booking_id), "patient_id": int(patient_id)},
+        )
+
 
     def save_booking_tests_and_amounts(
         self,
@@ -2315,20 +2679,102 @@ class BookingRepository:
         self,
         booking_id: int,
         pending_rows: list[dict],
+        source_type: str = "BOOKING",
+        appointment_id: int | None = None,
+        actor_user_id: int | None = None,
+        patient_ids_scope: list[int] | None = None,
     ) -> None:
         """
-        Persist only deselected/pending child tests sent by APK.
-        Missing/empty payload means no pending rows should exist for this booking.
+        Status-based pending child persistence.
+        - No hard delete.
+        - Previous open rows for same scope are marked resolved (pending_status=1).
+        - Current payload rows are inserted as open (pending_status=0).
         """
-        self.db.execute(
-            text(
-                """
-                DELETE FROM HCB_patient_test_PendingChildTest
-                WHERE booking_id = :booking_id
-                """
-            ),
-            {"booking_id": int(booking_id)},
-        )
+        src = str(source_type or "BOOKING").strip().upper() or "BOOKING"
+        appt_id = int(appointment_id or 0) if src == "APPOINTMENT" else None
+
+        scope_ids = sorted({int(x) for x in (patient_ids_scope or []) if int(x) > 0})
+
+        if src == "APPOINTMENT" and appt_id:
+            self.db.execute(
+                text(
+                    """
+                    UPDATE hcb_patient_test_pendingchildtest
+                    SET pending_status = 1,
+                        resolved_at = NOW(),
+                        resolved_by = :resolved_by,
+                        updated_at = NOW()
+                    WHERE booking_id = :booking_id
+                      AND UPPER(TRIM(COALESCE(source_type, 'BOOKING'))) = 'APPOINTMENT'
+                      AND IFNULL(appointment_id, 0) = :appointment_id
+                      AND IFNULL(pending_status, 0) = 0
+                    """
+                ),
+                {
+                    "booking_id": int(booking_id),
+                    "appointment_id": int(appt_id),
+                    "resolved_by": self._to_int(actor_user_id),
+                },
+            )
+            if scope_ids:
+                self.db.execute(
+                    text(
+                        """
+                        UPDATE hcb_patient_test_pendingchildtest
+                        SET pending_status = 1,
+                            resolved_at = NOW(),
+                            resolved_by = :resolved_by,
+                            updated_at = NOW()
+                        WHERE booking_id = :booking_id
+                          AND UPPER(TRIM(COALESCE(source_type, 'BOOKING'))) = 'BOOKING'
+                          AND patient_id IN :pids
+                          AND IFNULL(pending_status, 0) = 0
+                        """
+                    ).bindparams(bindparam("pids", expanding=True)),
+                    {
+                        "booking_id": int(booking_id),
+                        "resolved_by": self._to_int(actor_user_id),
+                        "pids": scope_ids,
+                    },
+                )
+            else:
+                self.db.execute(
+                    text(
+                        """
+                        UPDATE hcb_patient_test_pendingchildtest
+                        SET pending_status = 1,
+                            resolved_at = NOW(),
+                            resolved_by = :resolved_by,
+                            updated_at = NOW()
+                        WHERE booking_id = :booking_id
+                          AND UPPER(TRIM(COALESCE(source_type, 'BOOKING'))) = 'BOOKING'
+                          AND IFNULL(pending_status, 0) = 0
+                        """
+                    ),
+                    {
+                        "booking_id": int(booking_id),
+                        "resolved_by": self._to_int(actor_user_id),
+                    },
+                )
+        else:
+            self.db.execute(
+                text(
+                    """
+                    UPDATE hcb_patient_test_pendingchildtest
+                    SET pending_status = 1,
+                        resolved_at = NOW(),
+                        resolved_by = :resolved_by,
+                        updated_at = NOW()
+                    WHERE booking_id = :booking_id
+                      AND UPPER(TRIM(COALESCE(source_type, 'BOOKING'))) = 'BOOKING'
+                      AND IFNULL(pending_status, 0) = 0
+                    """
+                ),
+                {
+                    "booking_id": int(booking_id),
+                    "resolved_by": self._to_int(actor_user_id),
+                },
+            )
 
         grouped: dict[tuple[int, int, int, str], dict] = {}
 
@@ -2427,10 +2873,12 @@ class BookingRepository:
             self.db.execute(
                 text(
                     """
-                    INSERT INTO HCB_patient_test_PendingChildTest
-                    (booking_id, booking_patient_id, patient_id, root_booked_code, root_test_name, pending_child_tests_json, created_at, updated_at)
+                    INSERT INTO hcb_patient_test_pendingchildtest
+                    (booking_id, booking_patient_id, patient_id, root_booked_code, root_test_name, pending_child_tests_json,
+                     pending_status, source_type, appointment_id, resolved_at, resolved_by, created_at, updated_at)
                     VALUES
-                    (:booking_id, :booking_patient_id, :patient_id, :root_booked_code, :root_test_name, :pending_child_tests_json, NOW(), NOW())
+                    (:booking_id, :booking_patient_id, :patient_id, :root_booked_code, :root_test_name, :pending_child_tests_json,
+                     0, :source_type, :appointment_id, NULL, NULL, NOW(), NOW())
                     """
                 ),
                 {
@@ -2440,15 +2888,10 @@ class BookingRepository:
                     "root_booked_code": bucket["root_booked_code"],
                     "root_test_name": bucket["root_test_name"],
                     "pending_child_tests_json": json.dumps(payload_json, ensure_ascii=False),
+                    "source_type": src,
+                    "appointment_id": appt_id,
                 },
             )
-
-
-
-
-
-
-
 
 
     def acquire_booking_completion_lock(self, booking_id: int, wait_timeout_sec: int = 120) -> bool:
@@ -2506,6 +2949,7 @@ class BookingRepository:
         updates: list[dict],
         actor_user_id: int,
         include_payment_fields: bool = True,
+        recompute_booking_totals: bool = True,
     ) -> None:
         cols = self._get_table_columns("hhome_collection_booking_patient")
         pm_cols = self._get_table_columns("hpatient_master")
@@ -2534,6 +2978,9 @@ class BookingRepository:
                 if rv is not None:
                     updates_sql.append("report_delivery=:report_delivery")
                     params["report_delivery"] = str(rv or "").strip() or None
+            if "referred_by" in cols and row.get("referred_by") is not None:
+                updates_sql.append("referred_by=:referred_by")
+                params["referred_by"] = str(row.get("referred_by") or "").strip() or None
             if include_payment_fields and "payment_mode" in cols:
                 pm = row.get("payment_mode")
                 if isinstance(pm, list):
@@ -2620,13 +3067,21 @@ class BookingRepository:
                         tags.append("tough vein")
                         self.db.execute(text("UPDATE hpatient_master SET tag=:tag WHERE id=:pid"), {"tag": ",".join(tags), "pid": patient_id})
 
-        self._recompute_booking_amounts_from_active_tests(int(booking_id))
+        if recompute_booking_totals:
+            self._recompute_booking_amounts_from_active_tests(int(booking_id))
 
     def _is_manual_hcb_slip(self, value: object) -> bool:
         v = str(value or "").strip().lower()
         return v in {"manual hcb slip", "manual_hcb_slip", "manual hc slip", "manual_hc_slip", "manual_slip", "manual-slip", "hcb_slip", "hcb-slip"}
 
-    def apply_booking_completion_patientwise(self, booking_id: int, updates: list[dict], actor_user_id: int) -> tuple[int, list[dict]]:
+    def apply_booking_completion_patientwise(
+        self,
+        booking_id: int,
+        updates: list[dict],
+        actor_user_id: int,
+        complete_time: str | None = None,
+        complete_location: str | None = None,
+    ) -> tuple[int, list[dict]]:
         rows = updates or []
         manual_patient_ids: set[int] = set()
         completed_patient_ids: set[int] = set()
@@ -2726,6 +3181,13 @@ class BookingRepository:
             text("UPDATE hhome_collection_booking SET booking_status=:st WHERE id=:bid"),
             {"st": int(final_status), "bid": int(booking_id)},
         )
+        if final_status == 3:
+            self._apply_booking_lifecycle_fields(
+                booking_id=int(booking_id),
+                action="complete",
+                complete_time=complete_time,
+                complete_location=complete_location,
+            )
         self.db.commit()
 
         patient_rows = self.get_booking_patient_status_rows(booking_id)
@@ -2742,6 +3204,8 @@ class BookingRepository:
         if not src:
             return
 
+        any_cancel_processed = False
+
         for raw in (updates or []):
             row = raw or {}
             try:
@@ -2756,6 +3220,7 @@ class BookingRepository:
                 continue
 
             # Drop active tests in original booking for cancelled patient.
+            any_cancel_processed = True
             self.db.execute(
                 text(
                     """
@@ -2787,13 +3252,17 @@ class BookingRepository:
             }
             cols = ["caller_id", "selected_address_id", "address_snapshot_json", "preferred_visit_date", "preferred_time_slot", "booking_status", "assigned_phlebotomist_id", "created_by"]
             vals = [":caller_id", ":selected_address_id", ":address_snapshot_json", ":preferred_visit_date", ":preferred_time_slot", ":booking_status", ":assigned_phlebotomist_id", ":created_by"]
+            if "booking_code" in booking_cols:
+                cols.append("booking_code")
+                vals.append(":booking_code")
+                params["booking_code"] = f"HC26-PENDING-{int(booking_id)}-{int(pid)}"
             if has_ref:
                 cols.append("bkg_ref_flag")
                 vals.append(":bkg_ref_flag")
                 params["bkg_ref_flag"] = int(booking_id)
             ins = self.db.execute(text(f"INSERT INTO hhome_collection_booking ({', '.join(cols)}) VALUES ({', '.join(vals)})"), params)
             new_booking_id = int(ins.lastrowid)
-            new_code = f"HHCB-{new_booking_id:06d}"
+            new_code = f"HC26-{new_booking_id}"
             self.db.execute(text("UPDATE hhome_collection_booking SET booking_code=:code WHERE id=:bid"), {"code": new_code, "bid": new_booking_id})
 
             bp_status = 0
@@ -2881,8 +3350,9 @@ class BookingRepository:
             # Recompute new rescheduled booking amount summary from its active tests.
             self._recompute_booking_amounts_from_active_tests(new_booking_id)
 
-        # Recompute original booking after cancellations/drops so dashboard totals stay correct.
-        self._recompute_booking_amounts_from_active_tests(int(booking_id))
+        # Recompute original booking only when this handler actually processed cancelled patient changes.
+        if any_cancel_processed:
+            self._recompute_booking_amounts_from_active_tests(int(booking_id))
 
     def create_auto_followup_appointment(
         self,
@@ -3178,8 +3648,15 @@ class BookingRepository:
                 "created_by": int(created_by),
             },
         )
+        batch_id = int(getattr(res, "lastrowid", 0) or 0)
+        if batch_id > 0 and "batch_code" in self._get_table_columns("hhome_collection_batch"):
+            batch_code = f"BATCH{datetime.now():%y}-{batch_id}"
+            self.db.execute(
+                text("UPDATE hhome_collection_batch SET batch_code=:batch_code WHERE id=:batch_id"),
+                {"batch_code": batch_code, "batch_id": batch_id},
+            )
         self.db.commit()
-        return int(getattr(res, "lastrowid", 0) or 0)
+        return batch_id
 
     def list_hhome_collection_batch_for_user(
         self,
@@ -3191,7 +3668,7 @@ class BookingRepository:
         rows = self.db.execute(
             text(
                 """
-                SELECT id, batch_json, booking_ids, patients_json, tubes_json, created_at
+                SELECT id, batch_code, batch_json, booking_ids, patients_json, tubes_json, created_at
                 FROM hhome_collection_batch
                 WHERE created_by = :created_by
                   AND created_at >= TIMESTAMP(DATE(DATE_SUB(NOW(), INTERVAL 4 HOUR)), '04:00:00')

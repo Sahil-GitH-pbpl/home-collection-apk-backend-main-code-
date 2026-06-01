@@ -73,6 +73,7 @@ class PatientDetails(BaseModel):
     panel_code: str | None = None
     panel_abarid: str | None = None
     selected_comp_cat_ids: str | None = None
+    referred_by: str | None = None
     selected_charge_modes: str | None = None
     selected_panel_companies: str | None = None
     additional_discount_amount: float | None = None
@@ -114,13 +115,16 @@ class BookingDetailsResponse(BaseModel):
     F_dis: float | None = None
     Ad_Dis: float | None = None
     total_amount: float | None = None
-    referred_by: str | None = None
     intrnl_rfrncd_by: str | None = None
 
 
 class BookingStatusUpdateRequest(BaseModel):
     action: Literal["assign", "start", "stop", "complete", "completed"]
     appointment_id: int | None = None
+    start_time: str | None = None
+    start_location: str | None = None
+    complete_time: str | None = None
+    complete_location: str | None = None
     additional_discount_mode: str | None = None
     additional_discount_value: float | None = None
     tests_payload: list[dict] | None = None
@@ -155,6 +159,8 @@ class BookingCancelRequest(BaseModel):
     appointment_id: int | None = None
     reason_text: str
     remark: str | None = None
+    complete_time: str | None = None
+    complete_location: str | None = None
     reschedule_requested: bool = False
     proposed_visit_date: date | None = None
     proposed_time_slot: str | None = None
@@ -317,6 +323,7 @@ class BatchPatientItem(BaseModel):
 
 class BatchBookingItem(BaseModel):
     booking_id: int
+    appointment_id: int | None = None
     booking_code: str | None = None
     patients: list[BatchPatientItem] = Field(default_factory=list)
 
@@ -342,6 +349,7 @@ class BatchSaveResponse(BaseModel):
 
 class BatchListItem(BaseModel):
     id: int
+    batch_code: str | None = None
     batch: dict = Field(default_factory=dict)
     booking_ids: list[int] = Field(default_factory=list)
     patients: list[dict] = Field(default_factory=list)

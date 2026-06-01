@@ -1,6 +1,9 @@
 ﻿from pathlib import Path
+from datetime import date, datetime
 import json
 import logging
+from time import perf_counter
+from collections import defaultdict
 
 from fastapi import HTTPException, status
 from sqlalchemy import bindparam, text
@@ -9,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.repositories.booking_repository import BookingRepository
+from app.services.service_note_pdf_generator import submit_pdf_generation
 from app.schemas.booking import (
     AddPatientToBookingRequest,
     AddPatientToBookingResponse,
@@ -41,6 +45,19 @@ class BookingService:
         if not src:
             return []
         return [x.strip() for x in src.split(',') if x and x.strip()]
+
+    @staticmethod
+    def _merge_csv_values(*values: object) -> str | None:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            for item in BookingService._split_csv_values(value):
+                key = item.strip().lower()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item.strip())
+        return ", ".join(merged) if merged else None
 
     _allowed_document_ext = {".pdf", ".jpg", ".jpeg", ".png"}
     _max_documents_per_patient = 5
@@ -75,6 +92,124 @@ class BookingService:
             return float(value or 0)
         except (TypeError, ValueError):
             return 0.0
+
+    @staticmethod
+    def _safe_date(value: object):
+        if value is None:
+            return None
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        if isinstance(value, datetime):
+            return value.date()
+        text = str(value).strip()
+        if not text or text in {"0000-00-00", "0000-00-00 00:00:00"}:
+            return None
+        try:
+            return date.fromisoformat(text[:10])
+        except (TypeError, ValueError):
+            return None
+
+    def _public_upload_url(self, relative_path: str) -> str:
+        rel = "/" + str(relative_path or "").strip().lstrip("/")
+        base = str(self._settings.main_web_domain or "").strip().rstrip("/")
+        if not base:
+            return rel
+        return f"{base}{rel}"
+
+    @staticmethod
+    def _safe_json_dict(raw_value: object) -> dict:
+        if isinstance(raw_value, dict):
+            return raw_value
+        if not raw_value:
+            return {}
+        try:
+            parsed = json.loads(raw_value) if isinstance(raw_value, str) else {}
+        except Exception:
+            parsed = {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _merge_address_snapshot(self, base_address: dict | None, snapshot_raw: object) -> dict:
+        address = dict(base_address or {})
+        snapshot = self._safe_json_dict(snapshot_raw)
+        if not snapshot:
+            return address
+        for key in (
+            "id",
+            "address_type",
+            "house_flat_no",
+            "floor",
+            "block_tower_no",
+            "street_line",
+            "landmark",
+            "colony_name",
+            "colony_name_snapshot",
+            "city",
+            "pincode",
+            "pincode_snapshot",
+            "route_no",
+            "route_no_snapshot",
+            "google_location",
+            "location_url",
+            "access_notes",
+        ):
+            value = snapshot.get(key)
+            if self._as_str(value) is not None:
+                address[key] = value
+        if self._as_str(address.get("colony_name_snapshot")) is None:
+            address["colony_name_snapshot"] = address.get("colony_name")
+        if self._as_str(address.get("pincode_snapshot")) is None:
+            address["pincode_snapshot"] = address.get("pincode")
+        if self._as_str(address.get("route_no_snapshot")) is None:
+            address["route_no_snapshot"] = address.get("route_no")
+        if self._as_str(address.get("location_url")) is None:
+            address["location_url"] = address.get("google_location")
+        return address
+
+    def _panel_meta_for_patient_row(self, row: dict) -> dict[str, dict[str, str | None]]:
+        comp_ids = [self._as_str(x) for x in self._split_csv_values(row.get("selected_comp_cat_ids"))]
+        charge_modes = [self._as_str(x) for x in self._split_csv_values(row.get("selected_charge_modes"))]
+        panel_names = [self._as_str(x) for x in self._split_csv_values(row.get("selected_panel_companies"))]
+        meta: dict[str, dict[str, str | None]] = {}
+        for idx, comp_cat_id in enumerate(comp_ids):
+            if not comp_cat_id:
+                continue
+            meta[comp_cat_id] = {
+                "panel_company": panel_names[idx] if idx < len(panel_names) else self._as_str(row.get("panel_company")),
+                "selected_charge_mode": charge_modes[idx] if idx < len(charge_modes) else None,
+            }
+        return meta
+
+    def _group_tests_into_panels(self, tests: list[dict], patient_row: dict) -> list[dict]:
+        panel_meta = self._panel_meta_for_patient_row(patient_row)
+        grouped: dict[tuple[str | None, str | None, str | None], list[dict]] = defaultdict(list)
+        for test in tests or []:
+            comp_cat_id = self._as_str(test.get("comp_cat_id"))
+            meta = panel_meta.get(comp_cat_id or "") if comp_cat_id else None
+            panel_company = self._as_str(test.get("panel_company")) or (meta or {}).get("panel_company") or self._as_str(patient_row.get("panel_company"))
+            selected_charge_mode = (meta or {}).get("selected_charge_mode")
+            key = (panel_company, comp_cat_id, selected_charge_mode)
+            grouped[key].append(
+                {
+                    "booked_code": self._as_str(test.get("booked_code")),
+                    "description": self._as_str(test.get("test_name") or test.get("description")) or self._as_str(test.get("booked_code")) or "-",
+                    "charge": self._to_float(test.get("charge")),
+                    "mrp": self._to_float(test.get("mrp")),
+                    "max_discount": self._to_float(test.get("max_discount")),
+                    "max_allowed_discount": self._to_float(test.get("max_allowed_discount")),
+                    "test_status": test.get("test_status"),
+                }
+            )
+        out: list[dict] = []
+        for (panel_company, comp_cat_id, selected_charge_mode), selected_tests in grouped.items():
+            out.append(
+                {
+                    "panel_company": panel_company,
+                    "comp_cat_id": comp_cat_id,
+                    "selected_charge_mode": selected_charge_mode,
+                    "selected_tests": selected_tests,
+                }
+            )
+        return out
 
     def _build_tests_from_appointment_snapshot(
         self,
@@ -126,39 +261,10 @@ class BookingService:
 
             tests_out: list[dict] = []
             seen_codes: set[str] = set()
-            parent_codes: set[str] = set()
-            code_meta: dict[str, dict] = {}
 
-            parent_node = parent_context_map.get(pid_key) or parent_context_map.get(str(pid_key)) or {}
-            for panel_meta, billing_meta, selected_rows in _iter_sections(parent_node):
-                panel_company = self._as_str(panel_meta.get("pname"))
-                comp_cat_id = self._as_str(billing_meta.get("comp_cat_id"))
-                for item in selected_rows:
-                    code = self._as_str(item.get("booked_code"))
-                    if not code:
-                        continue
-                    parent_codes.add(code)
-                    meta = code_meta.setdefault(code, {})
-                    if comp_cat_id and not meta.get("comp_cat_id"):
-                        meta["comp_cat_id"] = comp_cat_id
-                    if panel_company and not meta.get("panel_company"):
-                        meta["panel_company"] = panel_company
-
-            tests_node = tests_map.get(pid_key) or tests_map.get(str(pid_key)) or {}
-            for panel_meta, billing_meta, selected_rows in _iter_sections(tests_node):
-                panel_company = self._as_str(panel_meta.get("pname"))
-                comp_cat_id = self._as_str(billing_meta.get("comp_cat_id"))
-                for item in selected_rows:
-                    code = self._as_str(item.get("booked_code"))
-                    if not code:
-                        continue
-                    meta = code_meta.setdefault(code, {})
-                    if comp_cat_id and not meta.get("comp_cat_id"):
-                        meta["comp_cat_id"] = comp_cat_id
-                    if panel_company and not meta.get("panel_company"):
-                        meta["panel_company"] = panel_company
-
+            # Appointment response rule: show pending child tests first.
             pending_node = pending_map.get(pid_key) or pending_map.get(str(pid_key)) or {}
+            has_pending_rows = False
             for panel_meta, billing_meta, selected_rows in _iter_sections(pending_node):
                 panel_company = self._as_str(panel_meta.get("pname"))
                 comp_cat_id = self._as_str(billing_meta.get("comp_cat_id"))
@@ -166,37 +272,33 @@ class BookingService:
                     code = self._as_str(item.get("booked_code"))
                     if not code:
                         continue
-                    parent_code = self._as_str(item.get("parent_booked_code"))
-                    root_code = self._as_str(item.get("root_booked_code"))
-                    if parent_code:
-                        parent_codes.add(parent_code)
-                    if root_code:
-                        parent_codes.add(root_code)
+                    has_pending_rows = True
                     if code in seen_codes:
                         continue
-                    meta = dict(code_meta.get(parent_code or root_code or code, {}))
-                    if comp_cat_id and not meta.get("comp_cat_id"):
-                        meta["comp_cat_id"] = comp_cat_id
-                    if panel_company and not meta.get("panel_company"):
-                        meta["panel_company"] = panel_company
                     seen_codes.add(code)
                     tests_out.append({
                         "booked_code": code,
-                        "comp_cat_id": meta.get("comp_cat_id"),
-                        "panel_company": meta.get("panel_company"),
+                        "comp_cat_id": comp_cat_id,
+                        "panel_company": panel_company,
                         "test_name": self._as_str(item.get("description")) or self._as_str(item.get("test_name")) or code,
                         "test_status": 0,
-                        "mrp": 0.0,
-                        "charge": 0.0,
-                        "max_discount": 0.0,
+                        "mrp": self._to_float(item.get("mrp")),
+                        "charge": self._to_float(item.get("charge")),
+                        "max_discount": self._to_float(item.get("max_discount")),
                     })
 
+            if has_pending_rows:
+                result[pid] = tests_out
+                continue
+
+            # Fallback: selected/parent tests from tests_billing_map.
+            tests_node = tests_map.get(pid_key) or tests_map.get(str(pid_key)) or {}
             for panel_meta, billing_meta, selected_rows in _iter_sections(tests_node):
                 panel_company = self._as_str(panel_meta.get("pname"))
                 comp_cat_id = self._as_str(billing_meta.get("comp_cat_id"))
                 for item in selected_rows:
                     code = self._as_str(item.get("booked_code"))
-                    if not code or code in seen_codes or code in parent_codes:
+                    if not code or code in seen_codes:
                         continue
                     seen_codes.add(code)
                     tests_out.append({
@@ -264,6 +366,12 @@ class BookingService:
                 patient_base_discount += self._to_float(test.get("max_discount"))
                 patient_charge_total += self._to_float(test.get("charge"))
             row = update_map.get(int(pid)) or {}
+            _pmode = row.get("payment_mode")
+            if isinstance(_pmode, list):
+                _pmode = _pmode[0] if _pmode else None
+            _pamt = row.get("payment_amount")
+            if isinstance(_pamt, list):
+                _pamt = _pamt[0] if _pamt else 0
             patient_additional = self._to_float(row.get("additional_discount_amount"))
             patient_total = max(0.0, patient_charge_total - patient_additional)
             sub_total += patient_sub_total
@@ -276,8 +384,8 @@ class BookingService:
             payment_rows.append(
                 {
                     "patient_id": int(pid),
-                    "payment_mode": self._as_str(row.get("payment_mode")),
-                    "payment_amount": self._to_float(row.get("payment_amount")),
+                    "payment_mode": self._as_str(_pmode),
+                    "payment_amount": self._to_float(_pamt),
                     "due_amount": self._to_float(row.get("due_amount")),
                     "extra_amount": self._to_float(row.get("extra_amount")),
                     "additional_discount_amount": patient_additional,
@@ -312,12 +420,352 @@ class BookingService:
         if not text:
             return []
         return [x.strip() for x in text.split(',') if x and x.strip()]
+
+    def build_service_note_payload_by_id(
+        self,
+        booking_id: int | None = None,
+        appointment_id: int | None = None,
+    ) -> dict:
+        if booking_id is None and appointment_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="booking_id or appointment_id is required",
+            )
+
+        appointment_row = None
+        selected_patient_ids: list[int] = []
+        appointment_payment_snapshot: dict = {}
+        appointment_tests_snapshot_raw: str | None = None
+        appointment_patient_context: dict = {}
+
+        if appointment_id is not None:
+            appointment_row = self.repository.db.execute(
+                text(
+                    """
+                    SELECT
+                        id,
+                        booking_id,
+                        preferred_visit_date,
+                        preferred_time_slot,
+                        selected_address_id,
+                        address_snapshot_json,
+                        selected_patient_ids_json,
+                        appointment_tests_snapshot_json,
+                        payment_snapshot_json,
+                        assigned_phlebotomist_id
+                    FROM hhome_collection_booking_appointment
+                    WHERE id = :appointment_id
+                    LIMIT 1
+                    """
+                ),
+                {"appointment_id": int(appointment_id)},
+            ).mappings().first()
+            if not appointment_row:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Appointment not found",
+                )
+            resolved_booking_id = int(appointment_row.get("booking_id") or 0)
+            if booking_id is not None and int(booking_id) != resolved_booking_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Appointment does not belong to provided booking",
+                )
+            booking_id = resolved_booking_id
+            selected_patient_ids = self.repository._parse_selected_patient_ids(
+                appointment_row.get("selected_patient_ids_json")
+            )
+            appointment_tests_snapshot_raw = (
+                str(appointment_row.get("appointment_tests_snapshot_json"))
+                if appointment_row.get("appointment_tests_snapshot_json") is not None
+                else None
+            )
+            appointment_payment_snapshot = self._appointment_payment_snapshot_obj(
+                appointment_row.get("payment_snapshot_json")
+            )
+            appointment_patient_context = (
+                appointment_payment_snapshot.get("patient_context")
+                if isinstance(appointment_payment_snapshot.get("patient_context"), dict)
+                else {}
+            )
+
+        booking = self.repository.get_booking_by_id(int(booking_id or 0))
+        if not booking:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Booking not found",
+            )
+
+        address_id = (
+            appointment_row.get("selected_address_id")
+            if appointment_row and appointment_row.get("selected_address_id") is not None
+            else booking.selected_address_id
+        )
+        address = self.repository.get_address(address_id) or {}
+        address = self._merge_address_snapshot(
+            address,
+            (appointment_row.get("address_snapshot_json") if appointment_row else None) or getattr(booking, "address_snapshot_json", None),
+        )
+
+        patient_scope = selected_patient_ids if selected_patient_ids else None
+        booking_patient_cols = self.repository._get_table_columns("hhome_collection_booking_patient")
+        patient_master_cols = self.repository._get_table_columns("hpatient_master")
+        patient_params: dict[str, object] = {"booking_id": int(booking.id)}
+        patient_scope_sql = self.repository._build_patient_scope_where(
+            patient_ids=patient_scope,
+            params=patient_params,
+            column_name="bp.patient_id",
+        )
+
+        def _bp(col: str, alias: str | None = None) -> str:
+            out_alias = alias or col
+            return f"bp.{col} AS {out_alias}" if col in booking_patient_cols else f"NULL AS {out_alias}"
+
+        def _pm(col: str, alias: str | None = None) -> str:
+            out_alias = alias or col
+            return f"p.{col} AS {out_alias}" if col in patient_master_cols else f"NULL AS {out_alias}"
+
+        patient_rows = self.repository.db.execute(
+            text(
+                f"""
+                SELECT
+                    bp.id AS booking_patient_id,
+                    bp.patient_id AS patient_id,
+                    {_bp("booking_patient_status")},
+                    {_bp("cce_level_TBS", "test_booking_status")},
+                    {_bp("selected_comp_cat_ids")},
+                    {_bp("selected_charge_modes")},
+                    {_bp("selected_panel_companies")},
+                    {_bp("patient_final_amount")},
+                    {_bp("payment_amount")},
+                    {_bp("additional_discount_amount")},
+                    {_bp("payment_mode")},
+                    {_bp("due_amount")},
+                    {_bp("extra_amount")},
+                    {_bp("prescription_files")},
+                    {_bp("patient_photo_files")},
+                    {_bp("payment_screenshot_paths")},
+                    {_bp("APK_TBS", "apk_tbs")},
+                    {_bp("report_schedule")},
+                    {_bp("report_delivery")},
+                    {_bp("no_of_pricks")},
+                    {_bp("sample_collection_is")},
+                    {_pm("patient_code")},
+                    {_pm("title")},
+                    {_pm("full_name")},
+                    {_pm("gender")},
+                    {_pm("age_years")},
+                    {_pm("date_of_birth")},
+                    {_pm("contact_mobile")},
+                    {_pm("alternate_mobile")},
+                    {_pm("panel_company")},
+                    {_pm("card_number", "card_no")},
+                    {_pm("tag")},
+                    {_pm("patient_documents")}
+                FROM hhome_collection_booking_patient bp
+                INNER JOIN hpatient_master p ON p.id = bp.patient_id
+                WHERE bp.booking_id = :booking_id
+                {patient_scope_sql}
+                ORDER BY bp.id ASC, p.id ASC
+                """
+            ),
+            patient_params,
+        ).mappings().all()
+
+        if appointment_id is not None and appointment_tests_snapshot_raw:
+            tests_by_patient = self._build_tests_from_appointment_snapshot(
+                appointment_tests_snapshot_raw,
+                patient_ids=selected_patient_ids if selected_patient_ids else None,
+            )
+        else:
+            tests_by_patient = self.repository.get_tests_for_booking(
+                booking_id=int(booking.id),
+                patient_ids=selected_patient_ids if selected_patient_ids else None,
+                pending_only=False,
+            )
+
+        assigned_phlebo_id = (
+            int(appointment_row.get("assigned_phlebotomist_id") or 0)
+            if appointment_row
+            else int(getattr(booking, "assigned_phlebotomist_id", 0) or 0)
+        )
+        phlebo = None
+        if assigned_phlebo_id > 0:
+            phlebo = self.repository.db.execute(
+                text("SELECT id, name, contact FROM users WHERE id = :user_id LIMIT 1"),
+                {"user_id": assigned_phlebo_id},
+            ).mappings().first()
+
+        tests_payload: list[dict] = []
+        patient_updates: list[dict] = []
+        sample_collection_pick_patients: list[dict] = []
+        total_amount = self._to_float(getattr(booking, "total_amount", 0))
+        if appointment_id is not None:
+            summary = (
+                appointment_payment_snapshot.get("summary")
+                if isinstance(appointment_payment_snapshot.get("summary"), dict)
+                else {}
+            )
+            total_amount = self._to_float(summary.get("total_amount"))
+
+        for row in patient_rows:
+            patient_id = int(row.get("patient_id") or 0)
+            if patient_id <= 0:
+                continue
+            appointment_ctx = (
+                appointment_patient_context.get(str(patient_id))
+                if isinstance(appointment_patient_context.get(str(patient_id)), dict)
+                else {}
+            )
+            patient_name = " ".join(
+                x for x in [self._as_str(row.get("title")), self._as_str(row.get("full_name"))] if x
+            ).strip() or f"Patient {patient_id}"
+
+            prescription_files = self._split_csv_values(row.get("prescription_files"))
+            patient_documents = self._split_csv_values(row.get("patient_documents"))
+            patient_photo_files = self._split_csv_values(row.get("patient_photo_files"))
+            payment_screenshot_paths = self._split_csv_values(row.get("payment_screenshot_paths"))
+            apk_tbs = self._as_str(row.get("apk_tbs")) or self._as_str(row.get("test_booking_status"))
+            manual_hc_slip_paths = payment_screenshot_paths if self._is_manual_hcb_slip(apk_tbs) else []
+
+            patient_tests = tests_by_patient.get(patient_id, []) or []
+            tests_payload.append(
+                {
+                    "patient_id": patient_id,
+                    "test_booking_status": apk_tbs,
+                    "report_schedule": self._as_str(row.get("report_schedule")),
+                    "report_delivery_options": self._as_str(row.get("report_delivery")),
+                    "panels": self._group_tests_into_panels(patient_tests, row),
+                }
+            )
+
+            patient_final_amount = (
+                self._to_float(appointment_ctx.get("booking_total_amount"))
+                if appointment_id is not None and appointment_ctx.get("booking_total_amount") is not None
+                else self._to_float(row.get("patient_final_amount"))
+            )
+            if patient_final_amount <= 0:
+                patient_final_amount = round(sum(self._to_float(t.get("charge")) for t in patient_tests), 2)
+            payment_amount = (
+                self._to_float(appointment_ctx.get("payment_amount"))
+                if appointment_id is not None and appointment_ctx.get("payment_amount") is not None
+                else self._to_float(row.get("payment_amount"))
+            )
+
+            documents: list[dict] = []
+            for value in prescription_files:
+                documents.append(
+                    {
+                        "type": "prescription",
+                        "file": value,
+                        "url": self._public_upload_url(
+                            value if str(value).strip().startswith("/static/uploads/") else f"/static/uploads/prescriptions/{str(value).strip().lstrip('/')}"
+                        ),
+                    }
+                )
+            for value in patient_documents:
+                documents.append(
+                    {
+                        "type": "patient_document",
+                        "file": value,
+                        "url": self._public_upload_url(
+                            value if str(value).strip().startswith("/static/uploads/") else f"/static/uploads/patient_documents/{str(value).strip().lstrip('/')}"
+                        ),
+                    }
+                )
+
+            patient_updates.append(
+                {
+                    "booking_code": self._as_str(getattr(booking, "booking_code", None)),
+                    "patient_id": patient_id,
+                    "booking_patient_status": int(row.get("booking_patient_status") or 0),
+                    "booking_patient_id": int(row.get("booking_patient_id") or 0),
+                    "patient_name": patient_name,
+                    "apk_tbs": apk_tbs,
+                    "test_booking_status": self._as_str(row.get("test_booking_status")),
+                    "report_schedule": self._as_str(row.get("report_schedule")),
+                    "report_delivery": self._as_str(row.get("report_delivery")),
+                    "no_of_pricks": self._as_str(row.get("no_of_pricks")),
+                    "sample_collection_is": self._as_str(row.get("sample_collection_is")),
+                    "payment_mode": self._as_str(appointment_ctx.get("booking_payment_mode")) if appointment_id is not None else self._as_str(row.get("payment_mode")),
+                    "due_amount": self._to_float(appointment_ctx.get("booking_due_amount") if appointment_id is not None else row.get("due_amount")),
+                    "extra_amount": self._to_float(appointment_ctx.get("booking_extra_amount") if appointment_id is not None else row.get("extra_amount")),
+                    "additional_discount_amount": self._to_float(
+                        appointment_ctx.get("appointment_additional_discount_amount")
+                        if appointment_id is not None
+                        else row.get("additional_discount_amount")
+                    ),
+                    "payment_amount": payment_amount,
+                    "patient_final_amount": patient_final_amount,
+                    "prescription_files": prescription_files,
+                    "patient_documents": patient_documents,
+                    "patient_photo_files": patient_photo_files,
+                    "payment_screenshot_paths": payment_screenshot_paths,
+                    "manual_hc_slip_paths": manual_hc_slip_paths,
+                    "documents": documents,
+                }
+            )
+
+            sample_collection_pick_patients.append(
+                {
+                    "id": patient_id,
+                    "patient_id": patient_id,
+                    "sourcePatientId": patient_id,
+                    "booking_patient_status": int(row.get("booking_patient_status") or 0),
+                    "name": patient_name,
+                    "title": self._as_str(row.get("title")),
+                    "full_name": self._as_str(row.get("full_name")),
+                    "gender": self._as_str(row.get("gender")),
+                    "age_years": int(row.get("age_years")) if row.get("age_years") is not None else None,
+                    "date_of_birth": self._safe_date(row.get("date_of_birth")).isoformat() if self._safe_date(row.get("date_of_birth")) else None,
+                    "contact_mobile": self._as_str(row.get("contact_mobile")),
+                    "alternate_mobile": self._as_str(row.get("alternate_mobile")),
+                    "panel_company": self._as_str(row.get("panel_company")),
+                    "card_no": self._as_str(row.get("card_no")),
+                    "tag": self._as_str(row.get("tag")),
+                }
+            )
+
+        booking_date_value = (
+            appointment_row.get("preferred_visit_date")
+            if appointment_row and appointment_row.get("preferred_visit_date") is not None
+            else getattr(booking, "preferred_visit_date", None)
+        )
+        booking_date = booking_date_value.isoformat() if hasattr(booking_date_value, "isoformat") else self._as_str(booking_date_value)
+        time_slot = (
+            self._as_str(appointment_row.get("preferred_time_slot"))
+            if appointment_row
+            else self._as_str(getattr(booking, "preferred_time_slot", None))
+        )
+
+        payload = {
+            "booking_id": self._as_str(getattr(booking, "booking_code", None)) or int(booking.id),
+            "booking_code": self._as_str(getattr(booking, "booking_code", None)),
+            "id": int(booking.id),
+            "appointment_id": int(appointment_id) if appointment_id is not None else None,
+            "source_type": "APPOINTMENT" if appointment_id is not None else "BOOKING",
+            "patient_scope": "APPOINTMENT_SELECTED" if selected_patient_ids else "BOOKING_ALL_FALLBACK",
+            "booking_date": booking_date,
+            "time_slot": time_slot,
+            "address": address,
+            "total_amount": total_amount,
+            "referred_by": self._as_str(getattr(booking, "referred_by", None)),
+            "intrnl_rfrncd_by": self._as_str(getattr(booking, "intrnl_rfrncd_by", None)),
+            "phlebo_name": self._as_str(phlebo.get("name")) if phlebo else None,
+            "phlebo_mobile": self._as_str(phlebo.get("contact")) if phlebo else None,
+            "patient_updates": patient_updates,
+            "tests_payload": tests_payload,
+            "sample_collection_pick_patients": sample_collection_pick_patients,
+        }
+        return payload
+
     def get_my_assigned_bookings(
         self,
         user_id: int,
         limit: int = 50,
         offset: int = 0,
     ) -> list[BookingSummary]:
+        started_at = perf_counter()
         rows = self.repository.get_my_assigned_merged(
             user_id=user_id,
             status_filter=[0, 1, 2],
@@ -325,7 +773,7 @@ class BookingService:
             limit=max(1, min(limit, 500)),
             offset=max(0, offset),
         )
-        return [
+        result = [
             BookingSummary(
                 id=row["id"],
                 booking_status=row.get("booking_status"),
@@ -342,6 +790,15 @@ class BookingService:
             )
             for row in rows
         ]
+        self._logger.info(
+            "assigned_list_timing user_id=%s count=%s limit=%s offset=%s duration_ms=%.2f",
+            user_id,
+            len(result),
+            limit,
+            offset,
+            (perf_counter() - started_at) * 1000,
+        )
+        return result
 
     def get_my_assigned_history_bookings(
         self,
@@ -349,6 +806,7 @@ class BookingService:
         limit: int = 50,
         offset: int = 0,
     ) -> list[BookingSummary]:
+        started_at = perf_counter()
         rows = self.repository.get_my_assigned_merged(
             user_id=user_id,
             status_filter=[3, 4, 5],
@@ -356,7 +814,7 @@ class BookingService:
             limit=max(1, min(limit, 500)),
             offset=max(0, offset),
         )
-        return [
+        result = [
             BookingSummary(
                 id=row["id"],
                 booking_status=row.get("booking_status"),
@@ -373,6 +831,15 @@ class BookingService:
             )
             for row in rows
         ]
+        self._logger.info(
+            "assigned_history_timing user_id=%s count=%s limit=%s offset=%s duration_ms=%.2f",
+            user_id,
+            len(result),
+            limit,
+            offset,
+            (perf_counter() - started_at) * 1000,
+        )
+        return result
 
     def get_my_assigned_booking_details(
         self,
@@ -382,6 +849,7 @@ class BookingService:
         appointment_id: int | None = None,
         catalog_db: Session | None = None,
     ) -> BookingDetailsResponse:
+        started_at = perf_counter()
         if appointment_id is not None:
             booking = self.repository.get_booking_by_id(booking_id=booking_id)
         else:
@@ -484,6 +952,7 @@ class BookingService:
             booking_patient_status,
             test_booking_status,
             selected_comp_cat_ids,
+            patient_referred_by,
             selected_charge_modes,
             selected_panel_companies,
             additional_discount_amount,
@@ -504,15 +973,13 @@ class BookingService:
                 u = n.upper()
                 if "_CGHS_" in u:
                     dtype = "cghs_card"
-                elif "_PHOTO_" in u:
-                    dtype = "patient_photo"
                 else:
                     dtype = "patient_document"
-                url = f"/static/uploads/patient_documents/{n}"
+                url = self._public_upload_url(f"/static/uploads/patient_documents/{n}")
                 patient_documents.append({"file": n, "type": dtype, "url": url})
                 patient_document_urls.append(url)
             prescription_urls = [
-                f"/static/uploads/prescriptions/{name}"
+                self._public_upload_url(f"/static/uploads/prescriptions/{name}")
                 for name in prescription_files
             ]
             patient_ctx = appointment_patient_context.get(str(int(patient.id))) if appointment_id is not None else None
@@ -527,7 +994,7 @@ class BookingService:
                     full_name=patient.full_name,
                     gender=patient.gender,
                     age_years=patient.age_years,
-                    date_of_birth=patient.date_of_birth,
+                    date_of_birth=self._safe_date(patient.date_of_birth),
                     contact_mobile=patient.contact_mobile,
                     alternate_mobile=patient.alternate_mobile,
                     panel_company=patient.panel_company,
@@ -535,6 +1002,7 @@ class BookingService:
                     panel_code=identity.get("panel_code") if identity else None,
                     panel_abarid=identity.get("panel_abarid") if identity else None,
                     selected_comp_cat_ids=self._as_str(selected_comp_cat_ids),
+                    referred_by=self._as_str(patient_referred_by),
                     selected_charge_modes=self._as_str(selected_charge_modes),
                     selected_panel_companies=self._as_str(selected_panel_companies),
                     additional_discount_amount=(self._to_float(patient_ctx.get("appointment_additional_discount_amount")) if appointment_id is not None else self._to_float(additional_discount_amount)),
@@ -542,7 +1010,7 @@ class BookingService:
                     booking_due_amount=self._to_float(patient_ctx.get("booking_due_amount") if appointment_id is not None else due_amount),
                     booking_extra_amount=self._to_float(patient_ctx.get("booking_extra_amount") if appointment_id is not None else extra_amount),
                     booking_payment_mode=(self._as_str(patient_ctx.get("booking_payment_mode")) if appointment_id is not None else self._as_str(payment_mode)),
-                    tag=patient.tag,
+                    tag=self._merge_csv_values(patient.tag, getattr(booking, "booking_tags", None)),
                     patient_documents=patient_documents,
                     patient_document_urls=patient_document_urls,
                     prescription_files=prescription_files,
@@ -566,7 +1034,7 @@ class BookingService:
                         full_name=self._as_str(lp.get("full_name")),
                         gender=self._as_str(lp.get("gender")),
                         age_years=int(lp.get("age_years")) if lp.get("age_years") is not None else None,
-                        date_of_birth=lp.get("date_of_birth"),
+                        date_of_birth=self._safe_date(lp.get("date_of_birth")),
                         contact_mobile=self._as_str(lp.get("contact_mobile")),
                         alternate_mobile=self._as_str(lp.get("alternate_mobile")),
                         panel_company=self._as_str(lp.get("panel_company")),
@@ -585,7 +1053,7 @@ class BookingService:
             response_Ad_Dis = self._to_float(summary.get("additional_discount"))
             response_total_amount = self._to_float(summary.get("total_amount"))
 
-        return BookingDetailsResponse(
+        response = BookingDetailsResponse(
             booking_status=status_for_response,
             source_type="APPOINTMENT" if appointment_id is not None else "BOOKING",
             appointment_id=int(appointment_id) if appointment_id is not None else None,
@@ -597,9 +1065,17 @@ class BookingService:
             F_dis=response_F_dis,
             Ad_Dis=response_Ad_Dis,
             total_amount=response_total_amount,
-            referred_by=self._as_str(getattr(booking, 'referred_by', None)),
             intrnl_rfrncd_by=self._as_str(getattr(booking, 'intrnl_rfrncd_by', None)),
         )
+        self._logger.info(
+            "assigned_detail_timing booking_id=%s appointment_id=%s user_id=%s patients=%s duration_ms=%.2f",
+            booking_id,
+            appointment_id,
+            user_id,
+            len(patient_items),
+            (perf_counter() - started_at) * 1000,
+        )
+        return response
 
     def update_assigned_booking_status(
         self,
@@ -612,6 +1088,7 @@ class BookingService:
         patient_documents_map: dict[int, list] | None = None,
         payment_screenshots_map: dict[int, list] | None = None,
     ) -> BookingStatusUpdateResponse:
+        request_started_at = perf_counter()
         if appointment_id is not None:
             booking = self.repository.get_booking_by_id(booking_id=booking_id)
         else:
@@ -633,22 +1110,29 @@ class BookingService:
                 detail="Cancel action is not allowed on /status. Use /my-assigned/{booking_id}/cancel endpoint",
             )
         completion_lock_acquired = False
-        global_completion_lock_acquired = False
+        lock_wait_ms = 0.0
+        tests_phase_ms = 0.0
+        uploads_phase_started_at = 0.0
 
         try:
             if normalized_action == "complete" and appointment_id is None:
-                global_completion_lock_acquired = self.repository.acquire_global_completion_lock(wait_timeout_sec=180)
-                if not global_completion_lock_acquired:
+                lock_wait_started_at = perf_counter()
+                completion_lock_acquired = self.repository.acquire_booking_completion_lock(
+                    booking.id,
+                    wait_timeout_sec=self._settings.booking_completion_lock_wait_sec,
+                )
+                lock_wait_ms = (perf_counter() - lock_wait_started_at) * 1000
+                if not completion_lock_acquired:
                     raise HTTPException(
                         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                        detail="Another booking completion is in progress. Please retry shortly",
+                        detail="This booking completion is already in progress. Please retry shortly",
                     )
-                completion_lock_acquired = self.repository.acquire_booking_completion_lock(booking.id, wait_timeout_sec=120)
 
             if normalized_action == "complete" and payload is not None:
                 appointment_payment_screenshot_paths: dict[int, list[str]] = {}
                 incoming_tests = getattr(payload, "tests_payload", None)
                 if incoming_tests and appointment_id is None:
+                    tests_phase_started_at = perf_counter()
                     save_payload = MobileBookingTestsSaveRequest.model_validate({
                         "additional_discount_mode": getattr(payload, "additional_discount_mode", None),
                         "additional_discount_value": getattr(payload, "additional_discount_value", 0) or 0,
@@ -660,10 +1144,143 @@ class BookingService:
                         payload=save_payload,
                         catalog_db=catalog_db,
                     )
+                    tests_phase_ms = (perf_counter() - tests_phase_started_at) * 1000
+                if incoming_tests and appointment_id is not None:
+                    tests_billing_map: dict[str, dict] = {}
+                    for pnode in (incoming_tests or []):
+                        if not isinstance(pnode, dict):
+                            continue
+                        try:
+                            _pid = int(pnode.get("patient_id") or 0)
+                        except Exception:
+                            _pid = 0
+                        if _pid <= 0:
+                            continue
+                        k = str(_pid)
+                        _tbs = pnode.get("test_booking_status")
+                        tnode = {
+                            "panel": {"pname": ""},
+                            "billing": {"comp_cat_id": "", "selected_charge_mode": ""},
+                            "selected_tests": [],
+                            "panels": [],
+                            "cce_level_tbs": _tbs,
+                        }
+                        for sec in (pnode.get("panels") or []):
+                            if not isinstance(sec, dict):
+                                continue
+                            panel_name = str(sec.get("panel_company") or "").strip()
+                            comp_cat_id = str(sec.get("comp_cat_id") or "").strip()
+                            sel_mode = str(sec.get("selected_charge_mode") or "").strip()
+                            selected_tests = []
+                            for t in (sec.get("selected_tests") or []):
+                                if not isinstance(t, dict):
+                                    continue
+                                code = str(t.get("booked_code") or "").strip()
+                                if not code:
+                                    continue
+                                selected_tests.append({
+                                    "booked_code": code,
+                                    "description": str(t.get("description") or code).strip() or code,
+                                    "charge": float(t.get("charge") or 0),
+                                    "mrp": float(t.get("mrp") or 0),
+                                    "max_discount": float(t.get("max_discount") or 0),
+                                    "max_allowed_discount": float(t.get("max_allowed_discount") or 0),
+                                })
+                            tnode["panels"].append({
+                                "panel": {"pname": panel_name},
+                                "billing": {"comp_cat_id": comp_cat_id, "selected_charge_mode": sel_mode},
+                                "selected_tests": selected_tests,
+                            })
+                            tnode["selected_tests"].extend(selected_tests)
+
+                        tests_billing_map[k] = tnode
+
+                    pending_tests_map: dict[str, dict] = {}
+                    parent_context_map: dict[str, dict] = {}
+                    for prow in (getattr(payload, "pending_child_tests", None) or []):
+                        r = prow or {}
+                        try:
+                            _pid = int(r.get("patient_id") or 0)
+                        except Exception:
+                            _pid = 0
+                        if _pid <= 0:
+                            continue
+                        key = str(_pid)
+                        root_code = str(r.get("root_booked_code") or "").strip()
+                        root_name = str(r.get("root_test_name") or root_code).strip() or root_code
+                        if root_code:
+                            parent_context_map.setdefault(key, {
+                                "panel": {"pname": ""},
+                                "billing": {"comp_cat_id": "", "selected_charge_mode": ""},
+                                "selected_tests": [],
+                                "panels": [{"panel": {"pname": ""}, "billing": {"comp_cat_id": "", "selected_charge_mode": ""}, "selected_tests": []}],
+                                "cce_level_tbs": None,
+                            })
+                            _pr = {"booked_code": root_code, "description": root_name, "charge": 0, "mrp": 0, "max_discount": 0, "max_allowed_discount": 0}
+                            parent_context_map[key]["selected_tests"].append(_pr)
+                            parent_context_map[key]["panels"][0]["selected_tests"].append(_pr)
+
+                        child_rows = []
+                        for p in (r.get("pending") or r.get("pending_child_tests") or []):
+                            item = p or {}
+                            code = str(item.get("booked_code") or "").strip()
+                            if not code:
+                                continue
+                            child_rows.append({
+                                "booked_code": code,
+                                "parent_booked_code": str(item.get("parent_booked_code") or root_code).strip() or None,
+                                "description": str(item.get("description") or code).strip() or code,
+                                "charge": 0,
+                                "mrp": 0,
+                                "max_discount": 0,
+                                "max_allowed_discount": 0,
+                            })
+                        if child_rows:
+                            pending_tests_map.setdefault(key, {
+                                "panel": {"pname": ""},
+                                "billing": {"comp_cat_id": "", "selected_charge_mode": ""},
+                                "selected_tests": [],
+                                "panels": [{"panel": {"pname": ""}, "billing": {"comp_cat_id": "", "selected_charge_mode": ""}, "selected_tests": []}],
+                                "cce_level_tbs": None,
+                            })
+                            pending_tests_map[key]["selected_tests"].extend(child_rows)
+                            pending_tests_map[key]["panels"][0]["selected_tests"].extend(child_rows)
+
+                    appointment_snapshot_payload = {
+                        "tests_billing_map": tests_billing_map,
+                        "pending_tests_map": pending_tests_map,
+                        "parent_context_map": parent_context_map,
+                        "flow_type": "appointment_complete_payload",
+                    }
+                    self.repository.save_appointment_tests_snapshot(
+                        booking_id=int(booking.id),
+                        appointment_id=int(appointment_id),
+                        user_id=int(user_id),
+                        snapshot_payload=appointment_snapshot_payload,
+                    )
                 # Save only deselected/pending child tests for this booking context.
+                _pending_rows = getattr(payload, "pending_child_tests", None) or []
+                if appointment_id is not None and bool(getattr(payload, "followup_required", False)) and not _pending_rows:
+                    _pending_rows = self._appointment_pending_rows_fallback(
+                        booking_id=int(booking.id),
+                        appointment_id=int(appointment_id),
+                        user_id=int(user_id),
+                    )
+                _patient_scope_ids = []
+                for _u in (getattr(payload, "patient_updates", None) or []):
+                    try:
+                        _pid = int((_u or {}).get("patient_id") or 0)
+                    except Exception:
+                        _pid = 0
+                    if _pid > 0:
+                        _patient_scope_ids.append(_pid)
                 self.repository.replace_pending_child_tests_for_booking(
                     booking_id=booking.id,
-                    pending_rows=getattr(payload, "pending_child_tests", None) or [],
+                    pending_rows=_pending_rows,
+                    source_type=("APPOINTMENT" if appointment_id is not None else "BOOKING"),
+                    appointment_id=(int(appointment_id) if appointment_id is not None else None),
+                    actor_user_id=user_id,
+                    patient_ids_scope=_patient_scope_ids,
                 )
                 # Persist patient-level completion fields (APK_TBS/report/payment/pricks/sample collection/cancel metadata).
                 patient_updates = getattr(payload, "patient_updates", None) or []
@@ -673,6 +1290,7 @@ class BookingService:
                         updates=patient_updates,
                         actor_user_id=user_id,
                         include_payment_fields=(appointment_id is None),
+                        recompute_booking_totals=(appointment_id is None),
                     )
                     self.repository.handle_cancelled_patient_reschedule(
                         booking_id=booking.id,
@@ -681,6 +1299,8 @@ class BookingService:
                     )
 
                 if patient_documents_map:
+                    if uploads_phase_started_at == 0.0:
+                        uploads_phase_started_at = perf_counter()
                     booking_code = str(getattr(booking, "booking_code", "") or "").strip()
                     patient_updates_by_id: dict[int, dict] = {}
                     for row in (patient_updates or []):
@@ -724,14 +1344,17 @@ class BookingService:
                                     doc_types.append(dtype)
 
                         prescription_files: list = []
+                        patient_photo_files: list = []
                         patient_doc_files: list = []
                         patient_doc_types: list[str] = []
                         manual_hcb_files: list = []
                         for idx, f in enumerate(files):
                             dtype = doc_types[idx] if idx < len(doc_types) else ""
-                            if dtype in {"cghs_card", "patient_photo"}:
+                            if dtype == "cghs_card":
                                 patient_doc_files.append(f)
                                 patient_doc_types.append(dtype)
+                            elif dtype == "patient_photo":
+                                patient_photo_files.append(f)
                             elif dtype == "prescription":
                                 prescription_files.append(f)
                             elif self._is_manual_hcb_slip(dtype):
@@ -742,6 +1365,7 @@ class BookingService:
 
                         existing_prescriptions = self.repository.get_patient_prescription_paths(booking_id=booking.id, patient_id=patient_id)
                         existing_patient_docs = self.repository.get_patient_document_paths(patient_id=patient_id)
+                        existing_patient_photos = self.repository.get_patient_photo_paths(booking_id=booking.id, patient_id=patient_id)
                         saved_abs_paths: list[Path] = []
                         try:
                             if prescription_files:
@@ -756,6 +1380,19 @@ class BookingService:
                                     booking_id=booking.id,
                                     patient_id=patient_id,
                                     files=prescription_paths,
+                                )
+                            if patient_photo_files:
+                                patient_photo_paths = self._save_booking_patient_photos(
+                                    booking_code=booking_code,
+                                    patient_id=patient_id,
+                                    files=patient_photo_files,
+                                    existing_photos=existing_patient_photos,
+                                    saved_abs_paths=saved_abs_paths,
+                                )
+                                self.repository.update_patient_photo_files(
+                                    booking_id=booking.id,
+                                    patient_id=patient_id,
+                                    files=patient_photo_paths,
                                 )
                             if patient_doc_files:
                                 patient_doc_paths = self._save_patient_documents(
@@ -786,6 +1423,8 @@ class BookingService:
                             raise
 
                 if payment_screenshots_map:
+                    if uploads_phase_started_at == 0.0:
+                        uploads_phase_started_at = perf_counter()
                     booking_code = str(getattr(booking, "booking_code", "") or "").strip()
                     patient_updates_by_id: dict[int, dict] = {}
                     for row in (patient_updates or []):
@@ -825,7 +1464,7 @@ class BookingService:
                                 )
 
                 followup_required = bool(getattr(payload, "followup_required", False))
-                pending_child_rows = (getattr(payload, "pending_child_tests", None) or [])
+                pending_child_rows = (_pending_rows or [])
                 if followup_required and pending_child_rows:
                     selected_ids = sorted({
                         int((row or {}).get("patient_id") or 0)
@@ -996,6 +1635,10 @@ class BookingService:
                     appointment_id=appointment_id,
                     user_id=user_id,
                     action=normalized_action,
+                    start_time=(getattr(payload, "start_time", None) if payload is not None else None),
+                    start_location=(getattr(payload, "start_location", None) if payload is not None else None),
+                    complete_time=(getattr(payload, "complete_time", None) if payload is not None else None),
+                    complete_location=(getattr(payload, "complete_location", None) if payload is not None else None),
                 )
                 source_type = "APPOINTMENT"
                 detail = f"Appointment action '{normalized_action}' applied successfully"
@@ -1005,11 +1648,17 @@ class BookingService:
                         booking_id=booking.id,
                         updates=(getattr(payload, "patient_updates", None) or []),
                         actor_user_id=user_id,
+                        complete_time=(getattr(payload, "complete_time", None) if payload is not None else None),
+                        complete_location=(getattr(payload, "complete_location", None) if payload is not None else None),
                     )
                 else:
                     final_status, patient_rows = self.repository.apply_booking_action(
                         booking_id=booking.id,
                         action=normalized_action,
+                        start_time=(getattr(payload, "start_time", None) if payload is not None else None),
+                        start_location=(getattr(payload, "start_location", None) if payload is not None else None),
+                        complete_time=(getattr(payload, "complete_time", None) if payload is not None else None),
+                        complete_location=(getattr(payload, "complete_location", None) if payload is not None else None),
                     )
                 patient_scope = "BOOKING_ALL_FALLBACK"
                 source_type = "BOOKING"
@@ -1022,10 +1671,8 @@ class BookingService:
         finally:
             if completion_lock_acquired:
                 self.repository.release_booking_completion_lock(booking.id)
-            if global_completion_lock_acquired:
-                self.repository.release_global_completion_lock()
 
-        return BookingStatusUpdateResponse(
+        response = BookingStatusUpdateResponse(
             booking_id=booking.id,
             booking_status=final_status,
             action=action,
@@ -1035,6 +1682,42 @@ class BookingService:
             appointment_id=appointment_id,
             patient_scope=patient_scope,
         )
+        if normalized_action == "complete" and appointment_id is None:
+            try:
+                service_note_payload = self.build_service_note_payload_by_id(
+                    booking_id=(None if appointment_id is not None else int(booking.id)),
+                    appointment_id=(int(appointment_id) if appointment_id is not None else None),
+                )
+                submit_pdf_generation(service_note_payload, booking_id=int(booking.id))
+                self._logger.info(
+                    "[service note pdf] queued after completion booking_id=%s appointment_id=%s",
+                    booking.id,
+                    appointment_id,
+                )
+            except Exception:
+                self._logger.exception(
+                    "[service note pdf] post-completion queue failed booking_id=%s appointment_id=%s",
+                    booking.id,
+                    appointment_id,
+                )
+        elif normalized_action == "complete":
+            self._logger.info(
+                "[service note pdf] skipped for appointment completion booking_id=%s appointment_id=%s",
+                booking.id,
+                appointment_id,
+            )
+        self._logger.info(
+            "booking_status_timing booking_id=%s appointment_id=%s user_id=%s action=%s lock_wait_ms=%.2f tests_ms=%.2f uploads_ms=%.2f total_ms=%.2f",
+            booking_id,
+            appointment_id,
+            user_id,
+            normalized_action,
+            lock_wait_ms,
+            tests_phase_ms,
+            (perf_counter() - uploads_phase_started_at) * 1000 if uploads_phase_started_at else 0.0,
+            (perf_counter() - request_started_at) * 1000,
+        )
+        return response
     def cancel_assigned_booking_direct(
         self,
         booking_id: int,
@@ -1045,17 +1728,28 @@ class BookingService:
         proposed_visit_date: str | None = None,
         proposed_time_slot: str | None = None,
         appointment_id: int | None = None,
+        complete_time: str | None = None,
+        complete_location: str | None = None,
     ) -> dict:
-        booking = self.repository.get_assigned_booking_by_id(
-            booking_id=booking_id,
-            user_id=user_id,
-            exclude_cancelled=False,
-        )
-        if not booking:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Booking not found or not assigned to current user",
+        appointment_context = appointment_id is not None and int(appointment_id or 0) > 0
+        if appointment_context:
+            booking = self.repository.get_booking_by_id(booking_id=booking_id)
+            if not booking:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Booking not found",
+                )
+        else:
+            booking = self.repository.get_assigned_booking_by_id(
+                booking_id=booking_id,
+                user_id=user_id,
+                exclude_cancelled=False,
             )
+            if not booking:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Booking not found or not assigned to current user",
+                )
 
         reason = str(reason_text or "").strip()
         if not reason:
@@ -1068,12 +1762,14 @@ class BookingService:
             )
 
         try:
-            if appointment_id is not None and int(appointment_id or 0) > 0:
+            if appointment_context:
                 status_code, _patient_rows, _scope = self.repository.apply_appointment_action(
                     booking_id=booking.id,
                     appointment_id=int(appointment_id),
                     user_id=user_id,
                     action="cancel",
+                    complete_time=complete_time,
+                    complete_location=complete_location,
                 )
                 return {
                     "ok": True,
@@ -1089,6 +1785,8 @@ class BookingService:
                 actor_user_id=user_id,
                 reason_text=reason,
                 remark=remark,
+                complete_time=complete_time,
+                complete_location=complete_location,
                 reschedule_requested=bool(reschedule_requested),
                 proposed_visit_date=(str(proposed_visit_date).strip() if proposed_visit_date else None),
                 proposed_time_slot=(str(proposed_time_slot).strip() if proposed_time_slot else None),
@@ -1268,45 +1966,8 @@ class BookingService:
             )
 
 
-    def _mirror_upload_roots(self, kind: str) -> list[Path]:
-        local_root = Path(__file__).resolve().parents[2]
-        web_root = Path(r"C:\Users\user\Desktop\lead_capture_project_mainss\lead_capture_project_main")
-        if kind == "patient_documents":
-            rel = Path("app") / "static" / "uploads" / "patient_documents"
-            roots = [local_root / rel, web_root / rel]
-        elif kind == "prescriptions":
-            rel = Path("app") / "static" / "uploads" / "prescriptions"
-            roots = [local_root / rel, web_root / rel]
-        elif kind == "payment_shot":
-            rel = Path("app") / "static" / "uploads" / "payment_shot"
-            roots = [web_root / rel]
-        else:
-            rel = Path("app") / "static" / "uploads"
-            roots = [local_root / rel, web_root / rel]
-        uniq = []
-        seen = set()
-        for root in roots:
-            key = str(root.resolve()) if root.exists() else str(root)
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq.append(root)
-        return uniq
-
-    def _mirror_saved_upload(self, kind: str, relative_path: str, src_file: Path) -> None:
-        rel = Path(relative_path.replace("\\", "/"))
-        for root in self._mirror_upload_roots(kind):
-            dst = root / rel
-            try:
-                if dst.resolve() == src_file.resolve():
-                    continue
-            except Exception:
-                pass
-            try:
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                dst.write_bytes(src_file.read_bytes())
-            except Exception:
-                pass
+    def _shared_upload_root(self) -> Path:
+        return Path(self._settings.patient_documents_upload_base).resolve().parent
 
     @staticmethod
     def _cleanup_saved_files(paths: list[Path]) -> None:
@@ -1381,8 +2042,6 @@ class BookingService:
             saved_abs_paths.append(out_path)
             rel_saved = f"{rel_dir.as_posix()}/{out_name}"
             saved_rel_paths.append(rel_saved)
-            self._mirror_saved_upload("patient_documents", rel_saved, out_path)
-
         return saved_rel_paths
 
     def _save_booking_prescriptions(
@@ -1433,8 +2092,56 @@ class BookingService:
             saved_abs_paths.append(out_path)
             rel_saved = f"{rel_dir.as_posix()}/{out_name}"
             saved_rel_paths.append(rel_saved)
-            self._mirror_saved_upload("prescriptions", rel_saved, out_path)
+        return saved_rel_paths
 
+    def _save_booking_patient_photos(
+        self,
+        booking_code: str,
+        patient_id: int,
+        files: list,
+        existing_photos: list[str],
+        saved_abs_paths: list[Path],
+    ) -> list[str]:
+        clean_booking_code = str(booking_code or "").strip()
+        if not clean_booking_code:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Booking code is required for patient photo upload",
+            )
+
+        photo_base = Path(self._settings.patient_documents_upload_base).parent / "booking_patient_documents"
+        rel_dir = Path(clean_booking_code) / f"PT{int(patient_id)}"
+        base_dir = photo_base / rel_dir
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        saved_rel_paths: list[str] = list(existing_photos)
+        seq = len(existing_photos) + 1
+        for file in files:
+            filename = str(getattr(file, "filename", "") or "").strip()
+            ext = Path(filename).suffix.lower()
+            if ext not in self._allowed_document_ext:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid patient photo extension. Allowed: .pdf, .jpg, .jpeg, .png",
+                )
+
+            out_name = f"{clean_booking_code}_PT{int(patient_id)}_PHOTO_{seq}{ext}"
+            seq += 1
+            out_path = base_dir / out_name
+
+            file_obj = getattr(file, "file", None)
+            if file_obj is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid uploaded file payload",
+                )
+            content = file_obj.read()
+            if content is None:
+                content = b""
+            out_path.write_bytes(content)
+            saved_abs_paths.append(out_path)
+            rel_saved = f"{rel_dir.as_posix()}/{out_name}"
+            saved_rel_paths.append(rel_saved)
         return saved_rel_paths
 
     def _is_manual_hcb_slip(self, value: object) -> bool:
@@ -1450,8 +2157,7 @@ class BookingService:
         clean_booking_code = str(booking_code or "").strip()
         if not clean_booking_code:
             return []
-        web_root = Path(r"C:\Users\user\Desktop\lead_capture_project_mainss\lead_capture_project_main")
-        base_dir = web_root / "app" / "static" / "uploads" / "hc_slip" / clean_booking_code / f"PT{int(patient_id)}"
+        base_dir = self._shared_upload_root() / "hc_slip" / clean_booking_code / f"PT{int(patient_id)}"
         base_dir.mkdir(parents=True, exist_ok=True)
 
         saved_rel_paths: list[str] = []
@@ -1490,12 +2196,11 @@ class BookingService:
         clean_booking_code = str(booking_code or "").strip()
         if not clean_booking_code:
             return []
-        web_root = Path(r"C:\Users\user\Desktop\lead_capture_project_mainss\lead_capture_project_main")
         folder = str(category or "").strip().lower()
         if folder:
-            base_dir = web_root / "app" / "static" / "uploads" / "payment_shot" / folder / clean_booking_code / f"PT{int(patient_id)}"
+            base_dir = self._shared_upload_root() / "payment_shot" / folder / clean_booking_code / f"PT{int(patient_id)}"
         else:
-            base_dir = web_root / "app" / "static" / "uploads" / "payment_shot" / clean_booking_code / f"PT{int(patient_id)}"
+            base_dir = self._shared_upload_root() / "payment_shot" / clean_booking_code / f"PT{int(patient_id)}"
         base_dir.mkdir(parents=True, exist_ok=True)
 
         saved_rel_paths: list[str] = []
@@ -1858,6 +2563,7 @@ class BookingService:
             items.append(
                 BatchListItem(
                     id=int(row.get("id") or 0),
+                    batch_code=(str(row.get("batch_code")).strip() if row.get("batch_code") is not None else None),
                     batch=batch if isinstance(batch, dict) else {},
                     booking_ids=[int(x) for x in (booking_ids or []) if str(x).strip().isdigit()],
                     patients=patients if isinstance(patients, list) else [],
@@ -1881,6 +2587,8 @@ class BookingService:
 
         for b in (payload.bookings or []):
             bid = int(b.booking_id)
+            appointment_id = int(b.appointment_id) if b.appointment_id is not None else None
+            source_type = "APPOINTMENT" if appointment_id else "BOOKING"
             booking_ids.append(bid)
             for p in (b.patients or []):
                 pid = int(p.patient_id)
@@ -1888,6 +2596,8 @@ class BookingService:
                 pname = (p.patient_name or "").strip() or None
                 patients_rows.append({
                     "booking_id": bid,
+                    "appointment_id": appointment_id,
+                    "source_type": source_type,
                     "booking_code": b.booking_code,
                     "patient_id": pid,
                     "booking_patient_id": bpid,
@@ -1899,6 +2609,8 @@ class BookingService:
                         continue
                     tubes_rows.append({
                         "booking_id": bid,
+                        "appointment_id": appointment_id,
+                        "source_type": source_type,
                         "booking_code": b.booking_code,
                         "patient_id": pid,
                         "booking_patient_id": bpid,
@@ -1982,6 +2694,5 @@ class BookingService:
             message="Address updated successfully",
             address=AddressDetails.model_validate(updated),
         )
-
 
 

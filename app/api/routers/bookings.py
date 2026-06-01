@@ -1,9 +1,12 @@
 ﻿import json
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.requests import ClientDisconnect
 
 from app.api.dependencies import get_current_user
 from app.core.database import get_catalog_db, get_db
@@ -29,6 +32,18 @@ from app.schemas.booking import (
 from app.services.booking_service import BookingService
 
 router = APIRouter(prefix="/api/v1/bookings", tags=["Bookings"])
+logger = logging.getLogger("uvicorn.error")
+
+
+def _client_ip(request: Request) -> str:
+    forwarded_for = (request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+    if forwarded_for:
+        return forwarded_for
+    return request.client.host if request.client else ""
+
+
+def _user_label(user: User) -> str:
+    return f"{user.id}:{user.name}"
 
 
 @router.get("/my-assigned", response_model=list[BookingSummary])
@@ -64,11 +79,19 @@ def get_my_assigned_history_bookings(
 @router.get("/my-assigned/{booking_id}", response_model=BookingDetailsResponse)
 def get_my_assigned_booking_details(
     booking_id: int,
+    request: Request,
     appointment_id: int | None = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     catalog_db: Session = Depends(get_catalog_db),
 ) -> BookingDetailsResponse:
+    logger.info(
+        "assigned_booking_detail_request user=%s booking_id=%s appointment_id=%s client_ip=%s",
+        _user_label(current_user),
+        booking_id,
+        appointment_id,
+        _client_ip(request),
+    )
     service = BookingService(repository=BookingRepository(db))
     return service.get_my_assigned_booking_details(
         booking_id=booking_id,
@@ -97,6 +120,8 @@ def cancel_my_assigned_booking_direct(
         user_id=current_user.id,
         reason_text=payload.reason_text,
         remark=payload.remark,
+        complete_time=payload.complete_time,
+        complete_location=payload.complete_location,
         reschedule_requested=payload.reschedule_requested,
         proposed_visit_date=(payload.proposed_visit_date.isoformat() if payload.proposed_visit_date else None),
         proposed_time_slot=payload.proposed_time_slot,
@@ -121,7 +146,10 @@ async def update_my_assigned_booking_status(
     payment_screenshots_map: dict[int, list[StarletteUploadFile]] = {}
 
     if "multipart/form-data" in content_type:
-        form = await request.form()
+        try:
+            form = await request.form()
+        except ClientDisconnect as exc:
+            raise HTTPException(status_code=499, detail="Client disconnected during upload") from exc
         payload_raw = form.get("payload") or form.get("data") or form.get("body")
         if not payload_raw:
             raise HTTPException(status_code=422, detail="Missing payload in multipart request")
@@ -158,6 +186,16 @@ async def update_my_assigned_booking_status(
         payload = BookingStatusUpdateRequest.model_validate(payload_data)
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+    logger.info(
+        "assigned_booking_status_request user=%s booking_id=%s appointment_id=%s action=%s client_ip=%s content_type=%s",
+        _user_label(current_user),
+        booking_id,
+        payload.appointment_id,
+        payload.action,
+        _client_ip(request),
+        content_type or "application/json",
+    )
 
     return service.update_assigned_booking_status(
         booking_id=booking_id,
@@ -229,7 +267,10 @@ async def add_patient_to_existing_booking(
         return value
 
     if "multipart/form-data" in content_type:
-        form = await request.form()
+        try:
+            form = await request.form()
+        except ClientDisconnect as exc:
+            raise HTTPException(status_code=499, detail="Client disconnected during upload") from exc
         form_files = form.getlist("patient_documents")
         files = [f for f in form_files if isinstance(f, StarletteUploadFile)]
         payload_data = {
@@ -285,7 +326,10 @@ async def edit_patient_in_existing_booking(
         return value
 
     if "multipart/form-data" in content_type:
-        form = await request.form()
+        try:
+            form = await request.form()
+        except ClientDisconnect as exc:
+            raise HTTPException(status_code=499, detail="Client disconnected during upload") from exc
         form_files = form.getlist("patient_documents")
         files = [f for f in form_files if isinstance(f, StarletteUploadFile)]
         payload_data = {

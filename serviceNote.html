@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Home Collection Service Note - HC26-141</title>
+  <style>
+    :root { --ink:#1f2933; --muted:#5f6f7f; --line:#cfd8e3; --soft:#f5f8fb; --brand:#0f6b6e; --accent:#e7f4f2; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:#eef2f5; color:var(--ink); font-family:Arial,Helvetica,sans-serif; font-size:12px; line-height:1.35; }
+    .page { width:210mm; min-height:297mm; margin:12px auto; padding:14mm; background:#fff; box-shadow:0 10px 30px rgba(15,23,42,.12); page-break-after:always; }
+    .page:last-of-type { page-break-after:auto; }
+    header { display:grid; grid-template-columns:1fr auto; gap:18px; align-items:start; padding-bottom:12px; border-bottom:2px solid var(--brand); }
+    .brand-head { display:flex; align-items:center; gap:12px; }
+    .brand-head img { width:220px; height:auto; display:block; }
+    h1 { margin:0 0 4px; color:var(--brand); font-size:24px; font-weight:700; }
+    .subtitle { color:var(--muted); font-size:12px; }
+    .note-id { min-width:195px; padding:10px 12px; background:var(--accent); border:1px solid #b8ded8; border-radius:6px; }
+    .note-id div { display:flex; justify-content:space-between; gap:12px; margin:2px 0; }
+    .section { margin-top:14px; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+    .section-title { margin:0; padding:7px 10px; background:var(--soft); border-bottom:1px solid var(--line); color:var(--brand); font-size:13px; font-weight:700; }
+    .grid { display:grid; grid-template-columns:repeat(3,1fr); }
+    .grid.two { grid-template-columns:repeat(2,1fr); }
+    .field { min-height:48px; padding:8px 10px; border-right:1px solid var(--line); border-bottom:1px solid var(--line); }
+    .field:nth-child(3n) { border-right:0; }
+    .grid.two .field:nth-child(2n) { border-right:0; }
+    .label { display:block; margin-bottom:3px; color:var(--muted); font-size:10px; font-weight:700; text-transform:uppercase; }
+    .value { font-size:13px; font-weight:600; }
+    table { width:100%; border-collapse:collapse; }
+    th,td { padding:8px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { background:var(--soft); color:var(--muted); font-size:10px; text-transform:uppercase; }
+    .panel-info { display:grid; grid-template-columns:1fr 1fr; border-bottom:1px solid var(--line); background:#fbfdff; }
+    .panel-info div { padding:8px 10px; border-right:1px solid var(--line); }
+    .panel-info div:last-child { border-right:0; }
+    .tests-table td { width:50%; }
+    .tests-table td:first-child { border-right:1px solid var(--line); }
+    tr:last-child td { border-bottom:0; }
+    .notice { margin-top:14px; padding:10px 12px; border:1px solid #f0cf87; border-radius:6px; background:#fff8e6; color:#59430f; }
+    @page { size:A4; margin:0; }
+    @media print {
+      html, body { width:210mm; min-height:297mm; background:#fff; }
+      body { -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+      .page { width:210mm; min-height:297mm; margin:0; box-shadow:none; break-after:page; page-break-after:always; }
+      .page:last-of-type { break-after:auto; page-break-after:auto; }
+      header, .section, .notice { break-inside:avoid; page-break-inside:avoid; }
+      tr { break-inside:avoid; page-break-inside:avoid; }
+    }
+  </style>
+</head>
+<body>
+
+  <main class="page">
+    <header>
+      <div>
+        <div class="brand-head"><img src="Logo1.png" alt="Dr Bhasin's Lab Logo"></div>
+        <h1>Home Collection Service Note</h1>
+        <div class="subtitle">Patient copy for home sample collection and payment acknowledgement</div>
+      </div>
+      <div class="note-id">
+        <div><strong>Booking ID</strong><span>HC26-141</span></div>
+        <div><strong>Date</strong><span>22-05-2026</span></div>
+        <div><strong>Visit Slot</strong><span>07:00 AM to 07:30 AM</span></div>
+      </div>
+    </header>
+
+    <section class="section">
+      <h2 class="section-title">Visit Details</h2>
+      <div class="grid two">
+        <div class="field"><span class="label">Collection Address</span><span class="value">Office S 35, Floor Ground_F, Colony GREATER KAILASH 1, City Delhi - 110048. Access Notes: DONT RING</span></div>
+        <div class="field"><span class="label">Phlebotomist</span><span class="value">Mohd faizan</span></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Patient Details</h2>
+      <div class="grid">
+        <div class="field"><span class="label">Patient Name</span><span class="value">MS. RICHA</span></div>
+        <div class="field"><span class="label">Gender / Age</span><span class="value">Female / 40 Years</span></div>
+        <div class="field"><span class="label">Date of Birth</span><span class="value">-</span></div>
+        <div class="field"><span class="label">Mobile</span><span class="value">8527901356</span></div>
+        <div class="field"><span class="label">Report Schedule</span><span class="value">Routine</span></div>
+        <div class="field"><span class="label">No. of Pricks</span><span class="value pricks">1</span></div>
+      </div>
+      <div class="notice prick-note" style="display:none; margin:10px;">
+        Sorry: If more than one prick was required during sample collection, we sincerely apologize for the inconvenience caused.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Report Delivery</h2>
+      <div class="grid two">
+        <div class="field"><span class="label">Delivery Mode</span><span class="value">WhatsApp</span></div>
+        <div class="field"><span class="label">Dispatch Note</span><span class="value">Report will be shared on WhatsApp after report completion.</span></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="panel-info">
+        <div><span class="label">Panel Companies</span><span class="value">CGHS (P)</span></div>
+        <div><span class="label">Referred By</span><span class="value">-</span></div>
+      </div>
+      <table class="tests-table">
+        <tbody>
+          <tr><td>Blood Sugar (Fasting)</td><td>Blood Sugar (Post Prandial)</td></tr>
+          <tr><td>Liver Function Test</td><td>Lipid Profile</td></tr>
+          <tr><td>Thyroid Profile, Total</td><td>Extended Lipid Profile</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Payment Summary</h2>
+      <div class="grid two">
+        <div class="field"><span class="label">Payment Method</span><span class="value">Cash, Online</span></div>
+        <div class="field"><span class="label">Total Amount</span><span class="value">Rs. 2,520.00</span></div>
+      </div>
+    </section>
+
+  </main>
+
+  <main class="page">
+    <header>
+      <div>
+        <div class="brand-head"><img src="Logo1.png" alt="Dr Bhasin's Lab Logo"></div>
+        <h1>Home Collection Service Note</h1>
+        <div class="subtitle">Patient copy for home sample collection and payment acknowledgement</div>
+      </div>
+      <div class="note-id">
+        <div><strong>Booking ID</strong><span>HC26-141</span></div>
+        <div><strong>Date</strong><span>22-05-2026</span></div>
+        <div><strong>Visit Slot</strong><span>07:00 AM to 07:30 AM</span></div>
+      </div>
+    </header>
+
+    <section class="section">
+      <h2 class="section-title">Visit Details</h2>
+      <div class="grid two">
+        <div class="field"><span class="label">Collection Address</span><span class="value">Office S 35, Floor Ground_F, Colony GREATER KAILASH 1, City Delhi - 110048. Access Notes: DONT RING</span></div>
+        <div class="field"><span class="label">Phlebotomist</span><span class="value">Mohd faizan</span></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Patient Details</h2>
+      <div class="grid">
+        <div class="field"><span class="label">Patient Name</span><span class="value">MS. RICHA SAXENA SINGH</span></div>
+        <div class="field"><span class="label">Gender / Age</span><span class="value">Female / 41 Years</span></div>
+        <div class="field"><span class="label">Date of Birth</span><span class="value">-</span></div>
+        <div class="field"><span class="label">Mobile</span><span class="value">8527901356</span></div>
+        <div class="field"><span class="label">Report Schedule</span><span class="value">Routine</span></div>
+        <div class="field"><span class="label">No. of Pricks</span><span class="value pricks">1</span></div>
+      </div>
+      <div class="notice prick-note" style="display:none; margin:10px;">
+        Sorry: If more than one prick was required during sample collection, we sincerely apologize for the inconvenience caused.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Report Delivery</h2>
+      <div class="grid two">
+        <div class="field"><span class="label">Delivery Mode</span><span class="value">WhatsApp</span></div>
+        <div class="field"><span class="label">Dispatch Note</span><span class="value">Report will be shared on WhatsApp after report completion.</span></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="panel-info">
+        <div><span class="label">Panel Companies</span><span class="value">CGHS (P)</span></div>
+        <div><span class="label">Referred By</span><span class="value">-</span></div>
+      </div>
+      <table class="tests-table">
+        <tbody>
+          <tr><td>Haemogram With ESR</td><td>Haemoglobin</td></tr>
+          <tr><td>Differential Leucocyte Count with IG</td><td>Direct Coomb's Test</td></tr>
+          <tr><td>Haemoglobin HPLC</td><td></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Payment Summary</h2>
+      <div class="grid two">
+        <div class="field"><span class="label">Payment Method</span><span class="value">-</span></div>
+        <div class="field"><span class="label">Total Amount</span><span class="value">Rs. 1,650.00</span></div>
+      </div>
+    </section>
+
+  </main>
+
+  <main class="page">
+    <header>
+      <div>
+        <div class="brand-head"><img src="Logo1.png" alt="Dr Bhasin's Lab Logo"></div>
+        <h1>Home Collection Service Note</h1>
+        <div class="subtitle">Patient copy for home sample collection and payment acknowledgement</div>
+      </div>
+      <div class="note-id">
+        <div><strong>Booking ID</strong><span>HC26-141</span></div>
+        <div><strong>Date</strong><span>22-05-2026</span></div>
+        <div><strong>Visit Slot</strong><span>07:00 AM to 07:30 AM</span></div>
+      </div>
+    </header>
+
+    <section class="section">
+      <h2 class="section-title">Visit Details</h2>
+      <div class="grid two">
+        <div class="field"><span class="label">Collection Address</span><span class="value">Office S 35, Floor Ground_F, Colony GREATER KAILASH 1, City Delhi - 110048. Access Notes: DONT RING</span></div>
+        <div class="field"><span class="label">Phlebotomist</span><span class="value">Mohd faizan</span></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Patient Details</h2>
+      <div class="grid">
+        <div class="field"><span class="label">Patient Name</span><span class="value">Mr. AMRISH SINGH</span></div>
+        <div class="field"><span class="label">Gender / Age</span><span class="value">Male / 42 Years</span></div>
+        <div class="field"><span class="label">Date of Birth</span><span class="value">26-06-1979</span></div>
+        <div class="field"><span class="label">Mobile</span><span class="value">8527901356</span></div>
+        <div class="field"><span class="label">Report Schedule</span><span class="value">Urgent</span></div>
+        <div class="field"><span class="label">No. of Pricks</span><span class="value pricks">1</span></div>
+      </div>
+      <div class="notice prick-note" style="display:none; margin:10px;">
+        Sorry: If more than one prick was required during sample collection, we sincerely apologize for the inconvenience caused.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Report Delivery</h2>
+      <div class="grid two">
+        <div class="field"><span class="label">Delivery Mode</span><span class="value">Courier / WhatsApp</span></div>
+        <div class="field"><span class="label">Dispatch Note</span><span class="value">Report will be shared on WhatsApp; courier delivery will be done after 3-4 working days of report completion.</span></div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="panel-info">
+        <div><span class="label">Panel Companies</span><span class="value">PBPL PLUS (P)</span></div>
+        <div><span class="label">Referred By</span><span class="value">-</span></div>
+      </div>
+      <table class="tests-table">
+        <tbody>
+          <tr><td>HBsAg</td><td></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="section">
+      <h2 class="section-title">Payment Summary</h2>
+      <div class="grid two">
+        <div class="field"><span class="label">Payment Method</span><span class="value">-</span></div>
+        <div class="field"><span class="label">Total Amount</span><span class="value">Rs. 500.00</span></div>
+      </div>
+    </section>
+
+  </main>
+
+<script>
+  (function () {
+    var pages = document.querySelectorAll('.page');
+    pages.forEach(function (page) {
+      var pricksEl = page.querySelector('.pricks');
+      var noteEl = page.querySelector('.prick-note');
+      if (!pricksEl || !noteEl) return;
+      var pricks = parseInt((pricksEl.textContent || '').trim(), 10);
+      noteEl.style.display = (!isNaN(pricks) && pricks > 1) ? 'block' : 'none';
+    });
+  })();
+</script>
+</body>
+</html>

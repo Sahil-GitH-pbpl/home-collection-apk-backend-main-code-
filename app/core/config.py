@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 2010
     app_debug: bool = False
+    app_workers: int = 1
 
     mysql_host: str = "127.0.0.1"
     mysql_port: int = 3306
@@ -20,6 +21,7 @@ class Settings(BaseSettings):
     mysql_db: str = "lead_management"
     mysql_pool_size: int = 10
     mysql_max_overflow: int = 20
+    mysql_pool_timeout: int = 30
     mysql_pool_recycle: int = 1800
     catalog_mysql_host: str | None = None
     catalog_mysql_port: int | None = None
@@ -30,12 +32,21 @@ class Settings(BaseSettings):
     jwt_secret_key: str
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 720
+    jwt_access_token_expire_seconds: int | None = None
 
     cors_origins: List[str] = Field(default_factory=lambda: ["*"])
 
     ssl_cert_file: str = "./certs/server.crt"
     ssl_key_file: str = "./certs/server.key"
-    patient_documents_upload_base: str = "./app/static/uploads/patient_documents"
+    patient_documents_upload_base: str = "/home/arpraandhc/Desktop/arpra neo/arpra-neo/app/static/uploads/patient_documents"
+    web_upload_mirror_root: str | None = None
+    main_web_domain: str = "https://labmate.bhasinpathlabs.com:4672"
+    apk_public_domain: str = "https://labmate.bhasinpathlabs.com:2010"
+    booking_completion_lock_wait_sec: int = 3
+    pepipost_wa_enabled: bool = True
+    pepipost_wa_token: str | None = None
+    pepipost_wa_timeout: int = 8
+    pepipost_service_note_template: str = "newhomec"
 
     model_config = SettingsConfigDict(
         env_file=".env",
