@@ -29,10 +29,14 @@ from app.schemas.booking import (
     MobileBookingTestsSaveRequest,
     MobileBookingTestsSaveResponse,
     PatientDetails,
+    BatchBookingItem,
+    BatchPatientItem,
+    BatchReadyResponse,
     BatchSaveRequest,
     BatchSaveResponse,
     BatchListItem,
     BatchListResponse,
+    BatchTubeItem,
 )
 
 
@@ -534,6 +538,7 @@ class BookingService:
                     {_bp("booking_patient_status")},
                     {_bp("cce_level_TBS", "test_booking_status")},
                     {_bp("selected_comp_cat_ids")},
+                    {_bp("ref_by", "referred_by")},
                     {_bp("selected_charge_modes")},
                     {_bp("selected_panel_companies")},
                     {_bp("patient_final_amount")},
@@ -681,6 +686,7 @@ class BookingService:
                     "booking_patient_status": int(row.get("booking_patient_status") or 0),
                     "booking_patient_id": int(row.get("booking_patient_id") or 0),
                     "patient_name": patient_name,
+                    "referred_by": self._as_str(row.get("referred_by")),
                     "apk_tbs": apk_tbs,
                     "test_booking_status": self._as_str(row.get("test_booking_status")),
                     "report_schedule": self._as_str(row.get("report_schedule")),
@@ -787,6 +793,7 @@ class BookingService:
                 caller_mobile=self._as_str(row.get("caller_mobile")),
                 route=self._as_str(row.get("route")),
                 patient_names=self._split_patient_names(row.get("patient_names")),
+                tag=int(row.get("tag") or 0),
             )
             for row in rows
         ]
@@ -1291,7 +1298,14 @@ class BookingService:
                         actor_user_id=user_id,
                         include_payment_fields=(appointment_id is None),
                         recompute_booking_totals=(appointment_id is None),
+                        include_cmplt_tube_field=(appointment_id is None),
                     )
+                    if appointment_id is not None:
+                        self.repository.save_appointment_completed_tubes(
+                            booking_id=int(booking.id),
+                            appointment_id=int(appointment_id),
+                            updates=patient_updates,
+                        )
                     self.repository.handle_cancelled_patient_reschedule(
                         booking_id=booking.id,
                         updates=patient_updates,
@@ -2574,6 +2588,183 @@ class BookingService:
 
         return BatchListResponse(items=items)
 
+    @staticmethod
+    def _safe_json_list(raw_value: object) -> list:
+        if isinstance(raw_value, list):
+            return raw_value
+        if not raw_value:
+            return []
+        try:
+            parsed = json.loads(raw_value) if isinstance(raw_value, str) else []
+        except Exception:
+            parsed = []
+        return parsed if isinstance(parsed, list) else []
+
+    @staticmethod
+    def _normalize_tube_names(*values: object) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if value is None:
+                continue
+            if isinstance(value, list):
+                parts = value
+            else:
+                raw = str(value or "").strip()
+                if not raw:
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, list):
+                    parts = parsed
+                else:
+                    parts = raw.replace("|", ",").split(",")
+            for item in parts:
+                name = str(item or "").strip()
+                if not name:
+                    continue
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(name)
+        return out
+
+    @staticmethod
+    def _batch_patient_key(row: dict) -> tuple[str, int, int | None, int, int]:
+        source_type = str(row.get("source_type") or row.get("sourceType") or "").strip().upper()
+        if source_type not in {"BOOKING", "APPOINTMENT"}:
+            source_type = "APPOINTMENT" if row.get("appointment_id") or row.get("appointmentId") else "BOOKING"
+        try:
+            booking_id = int(row.get("booking_id") or row.get("bookingId") or 0)
+        except Exception:
+            booking_id = 0
+        appt_raw = row.get("appointment_id")
+        if appt_raw is None:
+            appt_raw = row.get("appointmentId")
+        try:
+            appointment_id = int(appt_raw) if appt_raw is not None and str(appt_raw).strip() else None
+        except Exception:
+            appointment_id = None
+        try:
+            booking_patient_id = int(row.get("booking_patient_id") or row.get("bookingPatientId") or 0)
+        except Exception:
+            booking_patient_id = 0
+        try:
+            patient_id = int(row.get("patient_id") or row.get("patientId") or 0)
+        except Exception:
+            patient_id = 0
+        return source_type, booking_id, appointment_id, booking_patient_id, patient_id
+
+    def get_my_batch_ready_bookings(self, *, user_id: int) -> BatchReadyResponse:
+        already_batched: set[tuple[str, int, int | None, int, int]] = set()
+        for batch_row in self.repository.list_hhome_collection_batch_payloads_for_user(created_by=user_id):
+            for raw_json in (batch_row.get("patients_json"), batch_row.get("tubes_json")):
+                for item in self._safe_json_list(raw_json):
+                    if not isinstance(item, dict):
+                        continue
+                    key = self._batch_patient_key(item)
+                    if key[1] > 0 and (key[3] > 0 or key[4] > 0):
+                        already_batched.add(key)
+
+        rows_by_booking: dict[tuple[int, int | None], dict] = {}
+
+        def add_patient(
+            *,
+            booking_id: int,
+            appointment_id: int | None,
+            booking_patient_id: int,
+            patient_id: int,
+            patient_name: str | None,
+            tube_names: list[str],
+        ) -> None:
+            source_type = "APPOINTMENT" if appointment_id else "BOOKING"
+            key = (source_type, int(booking_id), appointment_id, int(booking_patient_id or 0), int(patient_id or 0))
+            if key in already_batched:
+                return
+            if not tube_names:
+                return
+            group_key = (int(booking_id), appointment_id)
+            group = rows_by_booking.setdefault(
+                group_key,
+                {
+                    "booking_id": int(booking_id),
+                    "appointment_id": appointment_id,
+                    "booking_code": None,
+                    "patients": [],
+                },
+            )
+            group["patients"].append(
+                BatchPatientItem(
+                    patient_id=int(patient_id),
+                    booking_patient_id=int(booking_patient_id),
+                    patient_name=(str(patient_name).strip() if patient_name else None),
+                    tubes=[BatchTubeItem(tube_name=x) for x in tube_names],
+                )
+            )
+
+        for row in self.repository.list_completed_booking_patients_for_batch(user_id=user_id):
+            add_patient(
+                booking_id=int(row.get("booking_id") or 0),
+                appointment_id=None,
+                booking_patient_id=int(row.get("booking_patient_id") or 0),
+                patient_id=int(row.get("patient_id") or 0),
+                patient_name=(str(row.get("patient_name")).strip() if row.get("patient_name") is not None else None),
+                tube_names=self._normalize_tube_names(row.get("cmplt_tube"), row.get("additional_sample")),
+            )
+
+        appointment_rows = self.repository.list_completed_appointments_for_batch(user_id=user_id)
+        appointment_booking_ids = [int(x.get("booking_id") or 0) for x in appointment_rows]
+        patient_lookup: dict[tuple[int, int], dict] = {}
+        for p in self.repository.list_booking_patients_for_bookings(booking_ids=appointment_booking_ids):
+            try:
+                patient_lookup[(int(p.get("booking_id") or 0), int(p.get("patient_id") or 0))] = p
+            except Exception:
+                continue
+
+        for row in appointment_rows:
+            booking_id = int(row.get("booking_id") or 0)
+            appointment_id = int(row.get("appointment_id") or 0)
+            payload = self._safe_json_dict(row.get("cmplt_tube"))
+            patients = payload.get("patients") if isinstance(payload, dict) else []
+            if not isinstance(patients, list):
+                continue
+            for item in patients:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    patient_id = int(item.get("patient_id") or 0)
+                except Exception:
+                    patient_id = 0
+                if patient_id <= 0:
+                    continue
+                lookup = patient_lookup.get((booking_id, patient_id), {})
+                booking_patient_id = int(item.get("booking_patient_id") or lookup.get("booking_patient_id") or 0)
+                if booking_patient_id <= 0:
+                    continue
+                add_patient(
+                    booking_id=booking_id,
+                    appointment_id=appointment_id,
+                    booking_patient_id=booking_patient_id,
+                    patient_id=patient_id,
+                    patient_name=(str(lookup.get("patient_name")).strip() if lookup.get("patient_name") is not None else None),
+                    tube_names=self._normalize_tube_names(item.get("cmplt_tube"), item.get("additional_sample")),
+                )
+
+        bookings = [
+            BatchBookingItem(
+                booking_id=int(group["booking_id"]),
+                appointment_id=group["appointment_id"],
+                booking_code=group.get("booking_code"),
+                patients=group["patients"],
+            )
+            for group in rows_by_booking.values()
+            if group.get("patients")
+        ]
+        return BatchReadyResponse(bookings=bookings)
+
     def save_batch_handover(
         self,
         *,
@@ -2667,6 +2858,7 @@ class BookingService:
             "address_type": payload.address_type,
             "house_flat_no": payload.house_flat_no,
             "floor": payload.floor,
+            "block_tower_no": payload.block_tower_no,
             "street_line": payload.street_line,
             "landmark": payload.landmark,
             "colony_name": payload.colony_name,

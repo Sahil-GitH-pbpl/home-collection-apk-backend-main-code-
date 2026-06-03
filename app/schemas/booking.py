@@ -19,6 +19,7 @@ class BookingSummary(BaseModel):
     caller_mobile: str | None = None
     route: str | None = None
     patient_names: list[str] = Field(default_factory=list)
+    tag: int = 0
 
 
 class AddressDetails(BaseModel):
@@ -26,6 +27,7 @@ class AddressDetails(BaseModel):
     address_type: str | None = None
     house_flat_no: str | None = None
     floor: str | None = None
+    block_tower_no: str | None = None
     street_line: str | None = None
     landmark: str | None = None
     colony_name_snapshot: str | None = None
@@ -246,6 +248,7 @@ class EditBookingAddressRequest(BaseModel):
     address_type: str | None = None
     house_flat_no: str | None = None
     floor: str | None = None
+    block_tower_no: str | None = None
     street_line: str | None = None
     landmark: str | None = None
     colony_name: str | None = None
@@ -361,3 +364,5 @@ class BatchListResponse(BaseModel):
     items: list[BatchListItem] = Field(default_factory=list)
 
 
+class BatchReadyResponse(BaseModel):
+    bookings: list[BatchBookingItem] = Field(default_factory=list)

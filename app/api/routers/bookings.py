@@ -25,6 +25,7 @@ from app.schemas.booking import (
     EditPatientInBookingResponse,
     EditBookingAddressRequest,
     EditBookingAddressResponse,
+    BatchReadyResponse,
     BatchSaveRequest,
     BatchSaveResponse,
     BatchListResponse,
@@ -209,6 +210,18 @@ async def update_my_assigned_booking_status(
     )
 
 
+
+
+@router.get(
+    "/my-assigned/batch/ready",
+    response_model=BatchReadyResponse,
+)
+def get_my_assigned_batch_ready(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> BatchReadyResponse:
+    service = BookingService(repository=BookingRepository(db))
+    return service.get_my_batch_ready_bookings(user_id=current_user.id)
 
 
 @router.get(

@@ -306,7 +306,6 @@ def build_service_note_html(payload: dict, output_path: str | Path) -> Path:
     time_slot = _clean(payload.get("time_slot"))
     phlebo_name = _clean(payload.get("phlebo_name"))
     address_text = _address_text(address)
-    referred_by = _clean(payload.get("referred_by"))
     logo_uri = _logo_uri()
 
     logo_img_html = f"<img class=\"brand-logo\" src=\"{logo_uri}\" alt=\"Dr Bhasin's Lab logo\">" if logo_uri else ""
@@ -335,6 +334,7 @@ def build_service_note_html(payload: dict, output_path: str | Path) -> Path:
         due_amount = _money(update.get("due_amount"))
         extra_amount = _money(update.get("extra_amount"))
         panel_names = _panel_companies(tests_payload, patient_meta)
+        referred_by = _clean(update.get("referred_by"))
 
         pages.append(
             f"""

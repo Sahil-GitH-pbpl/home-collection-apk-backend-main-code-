@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     app_name: str = "Home Collection Mobile API"
     app_env: str = "development"
     app_host: str = "0.0.0.0"
-    app_port: int = 2010
+    app_port: int = 2015
     app_debug: bool = False
     app_workers: int = 1
 
@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     patient_documents_upload_base: str = "/home/arpraandhc/Desktop/arpra neo/arpra-neo/app/static/uploads/patient_documents"
     web_upload_mirror_root: str | None = None
     main_web_domain: str = "https://labmate.bhasinpathlabs.com:4672"
-    apk_public_domain: str = "https://labmate.bhasinpathlabs.com:2010"
+    apk_public_domain: str = "https://labmate.bhasinpathlabs.com:2015"
     booking_completion_lock_wait_sec: int = 3
     pepipost_wa_enabled: bool = True
     pepipost_wa_token: str | None = None
@@ -59,6 +59,13 @@ class Settings(BaseSettings):
     def validate_mysql_db(cls, value: str) -> str:
         if value != "lead_management":
             raise ValueError("Only lead_management database is allowed")
+        return value
+
+    @field_validator("jwt_access_token_expire_seconds", mode="before")
+    @classmethod
+    def blank_jwt_expire_seconds_as_none(cls, value: object) -> object:
+        if value == "":
+            return None
         return value
 
     @property

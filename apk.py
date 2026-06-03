@@ -25,7 +25,7 @@ def main() -> None:
     load_env_file(base_dir / ".env")
 
     host = os.getenv("APP_HOST", "0.0.0.0")
-    port = int(os.getenv("APP_PORT", "2010"))
+    port = int(os.getenv("APP_PORT", "2015"))
     workers = max(1, int(os.getenv("APP_WORKERS", "1")))
     cert_file = os.getenv("SSL_CERT_FILE", "./certs/fullchain.pem")
     key_file = os.getenv("SSL_KEY_FILE", "./certs/privkey.pem")
