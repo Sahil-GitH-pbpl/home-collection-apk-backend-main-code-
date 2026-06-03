@@ -38,7 +38,7 @@ class HomeCollectionBookingPatient(Base):
     booking_patient_status: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     cce_level_TBS: Mapped[Optional[str]] = mapped_column("cce_level_TBS", String(120), nullable=True)
     selected_comp_cat_ids: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    referred_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    referred_by: Mapped[Optional[str]] = mapped_column("ref_by", String(255), nullable=True)
     selected_charge_modes: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     selected_panel_companies: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     patient_final_amount: Mapped[Optional[float]] = mapped_column("patient_final_amount", Numeric(12, 2), nullable=True)

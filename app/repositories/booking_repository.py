@@ -587,6 +587,11 @@ class BookingRepository:
                         ELSE 'BOOKING_ALL_FALLBACK'
                     END AS patient_scope,
                     {appointment_route_sql} AS route,
+                    CASE
+                        WHEN NULLIF(TRIM(COALESCE(b.booking_tags, '')), '') IS NOT NULL
+                          OR SUM(CASE WHEN NULLIF(TRIM(COALESCE(p.tag, '')), '') IS NOT NULL THEN 1 ELSE 0 END) > 0
+                        THEN 1 ELSE 0
+                    END AS tag,
                     GROUP_CONCAT(
                         DISTINCT TRIM(CONCAT(COALESCE(p.title, ''), ' ', COALESCE(p.full_name, '')))
                         ORDER BY bp.id, p.id
@@ -609,6 +614,7 @@ class BookingRepository:
                     a.{appointment_date_col},
                     a.{appointment_slot_col},
                     route,
+                    b.booking_tags,
                     c.primary_mobile
         """.format(
             appointment_id_col=appointment_id_col,
@@ -632,6 +638,7 @@ class BookingRepository:
                     0 AS patient_count,
                     'BOOKING_ALL_FALLBACK' AS patient_scope,
                     '' AS route,
+                    0 AS tag,
                     NULL AS patient_names
                 WHERE 1 = 0
             """
@@ -650,6 +657,7 @@ class BookingRepository:
                     0 AS patient_count,
                     'BOOKING_ALL_FALLBACK' AS patient_scope,
                     '' AS route,
+                    0 AS tag,
                     NULL AS patient_names
                 WHERE 1 = 0
             """
@@ -680,6 +688,11 @@ class BookingRepository:
                                 )
                             ELSE ''
                         END AS route,
+                        CASE
+                            WHEN NULLIF(TRIM(COALESCE(b.booking_tags, '')), '') IS NOT NULL
+                              OR SUM(CASE WHEN NULLIF(TRIM(COALESCE(p.tag, '')), '') IS NOT NULL THEN 1 ELSE 0 END) > 0
+                            THEN 1 ELSE 0
+                        END AS tag,
                         GROUP_CONCAT(
                             DISTINCT TRIM(CONCAT(COALESCE(p.title, ''), ' ', COALESCE(p.full_name, '')))
                             ORDER BY bp.id, p.id
@@ -698,7 +711,8 @@ class BookingRepository:
                         b.preferred_visit_date,
                         b.preferred_time_slot,
                         c.primary_mobile,
-                        route
+                        route,
+                        b.booking_tags
 
                     UNION ALL
 
@@ -729,6 +743,7 @@ class BookingRepository:
                 "patient_scope": str(row.get("patient_scope") or "BOOKING_ALL_FALLBACK"),
                 "route": str(row.get("route") or "").strip() or None,
                 "patient_names": str(row.get("patient_names") or "").strip() or None,
+                "tag": int(row.get("tag") or 0),
             }
             for row in rows
         ]
@@ -855,6 +870,7 @@ class BookingRepository:
             "address_type",
             "house_flat_no",
             "floor",
+            "block_tower_no",
             "street_line",
             "landmark",
             "colony_name",
@@ -2950,6 +2966,7 @@ class BookingRepository:
         actor_user_id: int,
         include_payment_fields: bool = True,
         recompute_booking_totals: bool = True,
+        include_cmplt_tube_field: bool = True,
     ) -> None:
         cols = self._get_table_columns("hhome_collection_booking_patient")
         pm_cols = self._get_table_columns("hpatient_master")
@@ -2978,8 +2995,8 @@ class BookingRepository:
                 if rv is not None:
                     updates_sql.append("report_delivery=:report_delivery")
                     params["report_delivery"] = str(rv or "").strip() or None
-            if "referred_by" in cols and row.get("referred_by") is not None:
-                updates_sql.append("referred_by=:referred_by")
+            if "ref_by" in cols and row.get("referred_by") is not None:
+                updates_sql.append("ref_by=:referred_by")
                 params["referred_by"] = str(row.get("referred_by") or "").strip() or None
             if include_payment_fields and "payment_mode" in cols:
                 pm = row.get("payment_mode")
@@ -3013,6 +3030,12 @@ class BookingRepository:
                     aval = ",".join([str(x).strip() for x in aval if str(x).strip()])
                 updates_sql.append("additional_sample=:additional_sample")
                 params["additional_sample"] = str(aval or "").strip() or None
+            if include_cmplt_tube_field and "cmplt_tube" in cols and row.get("cmplt_tube") is not None:
+                cval = row.get("cmplt_tube")
+                if isinstance(cval, list):
+                    cval = ",".join([str(x).strip() for x in cval if str(x).strip()])
+                updates_sql.append("cmplt_tube=:cmplt_tube")
+                params["cmplt_tube"] = str(cval or "").strip() or None
             if include_payment_fields and "additional_discount_amount" in cols and row.get("additional_discount_amount") is not None:
                 updates_sql.append("additional_discount_amount=:additional_discount_amount")
                 params["additional_discount_amount"] = float(row.get("additional_discount_amount") or 0)
@@ -3069,6 +3092,83 @@ class BookingRepository:
 
         if recompute_booking_totals:
             self._recompute_booking_amounts_from_active_tests(int(booking_id))
+
+    def save_appointment_completed_tubes(
+        self,
+        *,
+        booking_id: int,
+        appointment_id: int,
+        updates: list[dict],
+    ) -> None:
+        appt_cols = self._get_table_columns("hhome_collection_booking_appointment")
+        if "cmplt_tube" not in appt_cols:
+            return
+
+        patients: list[dict] = []
+        for raw in (updates or []):
+            row = raw or {}
+            if row.get("cmplt_tube") is None:
+                continue
+            try:
+                patient_id = int(row.get("patient_id") or 0)
+            except Exception:
+                patient_id = 0
+            if patient_id <= 0:
+                continue
+
+            try:
+                booking_patient_id = int(row.get("booking_patient_id") or 0)
+            except Exception:
+                booking_patient_id = 0
+            if booking_patient_id <= 0:
+                bp_row = self.db.execute(
+                    text(
+                        """
+                        SELECT id
+                        FROM hhome_collection_booking_patient
+                        WHERE booking_id=:booking_id AND patient_id=:patient_id
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"booking_id": int(booking_id), "patient_id": int(patient_id)},
+                ).fetchone()
+                booking_patient_id = int(getattr(bp_row, "id", 0) or 0) if bp_row else 0
+
+            tubes = row.get("cmplt_tube")
+            if isinstance(tubes, list):
+                tube_list = [str(x).strip() for x in tubes if str(x).strip()]
+            else:
+                tube_list = [x.strip() for x in str(tubes or "").split(",") if x.strip()]
+            if not tube_list:
+                continue
+
+            patients.append(
+                {
+                    "booking_patient_id": booking_patient_id or None,
+                    "patient_id": patient_id,
+                    "cmplt_tube": tube_list,
+                }
+            )
+
+        if not patients:
+            return
+
+        self.db.execute(
+            text(
+                """
+                UPDATE hhome_collection_booking_appointment
+                SET cmplt_tube=:cmplt_tube,
+                    updated_at=NOW()
+                WHERE id=:appointment_id AND booking_id=:booking_id
+                """
+            ),
+            {
+                "cmplt_tube": json.dumps({"patients": patients}, ensure_ascii=False),
+                "appointment_id": int(appointment_id),
+                "booking_id": int(booking_id),
+            },
+        )
 
     def _is_manual_hcb_slip(self, value: object) -> bool:
         v = str(value or "").strip().lower()
@@ -3685,6 +3785,95 @@ class BookingRepository:
         ).mappings().all()
         return [dict(x) for x in rows]
 
+    def list_hhome_collection_batch_payloads_for_user(self, *, created_by: int) -> list[dict]:
+        rows = self.db.execute(
+            text(
+                """
+                SELECT patients_json, tubes_json
+                FROM hhome_collection_batch
+                WHERE created_by = :created_by
+                ORDER BY id DESC
+                LIMIT 1000
+                """
+            ),
+            {"created_by": int(created_by)},
+        ).mappings().all()
+        return [dict(x) for x in rows]
+
+    def list_completed_booking_patients_for_batch(self, *, user_id: int) -> list[dict]:
+        rows = self.db.execute(
+            text(
+                """
+                SELECT
+                    b.id AS booking_id,
+                    NULL AS appointment_id,
+                    'BOOKING' AS source_type,
+                    bp.id AS booking_patient_id,
+                    bp.patient_id,
+                    NULLIF(TRIM(pm.full_name), '') AS patient_name,
+                    bp.cmplt_tube,
+                    bp.additional_sample
+                FROM hhome_collection_booking b
+                JOIN hhome_collection_booking_patient bp ON bp.booking_id = b.id
+                LEFT JOIN hpatient_master pm ON pm.id = bp.patient_id
+                WHERE b.assigned_phlebotomist_id = :user_id
+                  AND b.booking_status = 3
+                  AND COALESCE(bp.booking_patient_status, 0) = 3
+                  AND (
+                    NULLIF(TRIM(COALESCE(bp.cmplt_tube, '')), '') IS NOT NULL
+                    OR NULLIF(TRIM(COALESCE(bp.additional_sample, '')), '') IS NOT NULL
+                  )
+                ORDER BY b.id DESC, bp.id
+                LIMIT 500
+                """
+            ),
+            {"user_id": int(user_id)},
+        ).mappings().all()
+        return [dict(x) for x in rows]
+
+    def list_completed_appointments_for_batch(self, *, user_id: int) -> list[dict]:
+        rows = self.db.execute(
+            text(
+                """
+                SELECT
+                    b.id AS booking_id,
+                    ap.id AS appointment_id,
+                    'APPOINTMENT' AS source_type,
+                    ap.cmplt_tube
+                FROM hhome_collection_booking_appointment ap
+                JOIN hhome_collection_booking b ON b.id = ap.booking_id
+                WHERE ap.assigned_phlebotomist_id = :user_id
+                  AND COALESCE(ap.appointment_status, 0) = 3
+                  AND NULLIF(TRIM(COALESCE(ap.cmplt_tube, '')), '') IS NOT NULL
+                ORDER BY ap.id DESC
+                LIMIT 500
+                """
+            ),
+            {"user_id": int(user_id)},
+        ).mappings().all()
+        return [dict(x) for x in rows]
+
+    def list_booking_patients_for_bookings(self, *, booking_ids: list[int]) -> list[dict]:
+        ids = sorted({int(x) for x in (booking_ids or []) if int(x) > 0})
+        if not ids:
+            return []
+        rows = self.db.execute(
+            text(
+                """
+                SELECT
+                    bp.booking_id,
+                    bp.id AS booking_patient_id,
+                    bp.patient_id,
+                    NULLIF(TRIM(pm.full_name), '') AS patient_name
+                FROM hhome_collection_booking_patient bp
+                LEFT JOIN hpatient_master pm ON pm.id = bp.patient_id
+                WHERE bp.booking_id IN :booking_ids
+                """
+            ).bindparams(bindparam("booking_ids", expanding=True)),
+            {"booking_ids": ids},
+        ).mappings().all()
+        return [dict(x) for x in rows]
+
     def get_booking_address_context(self, booking_id: int) -> dict | None:
         row = self.db.execute(
             text(
@@ -3713,6 +3902,7 @@ class BookingRepository:
             "address_type": "address_type",
             "house_flat_no": "house_flat_no",
             "floor": "floor",
+            "block_tower_no": "block_tower_no",
             "street_line": "street_line",
             "landmark": "landmark",
             "colony_name": "colony_name",
