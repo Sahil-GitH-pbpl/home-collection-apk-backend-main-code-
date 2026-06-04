@@ -314,6 +314,12 @@ def build_service_note_html(payload: dict, output_path: str | Path) -> Path:
     updates = _updates(payload)
     for index, update in enumerate(updates, start=1):
         try:
+            booking_patient_status = int(update.get("booking_patient_status") or 0)
+        except Exception:
+            booking_patient_status = 0
+        if booking_patient_status != 3:
+            continue
+        try:
             patient_id = int(update.get("patient_id") or 0)
         except Exception:
             patient_id = 0

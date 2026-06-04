@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     pepipost_wa_token: str | None = None
     pepipost_wa_timeout: int = 8
     pepipost_service_note_template: str = "newhomec"
+    local_whatsapp_enabled: bool = True
+    local_whatsapp_api_url: str = "http://10.1.1.44:3004/api/messages/send"
+    local_whatsapp_account_id: int = 1
 
     model_config = SettingsConfigDict(
         env_file=".env",

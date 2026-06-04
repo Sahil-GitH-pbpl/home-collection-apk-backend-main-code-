@@ -2705,7 +2705,12 @@ class BookingService:
                 )
             )
 
-        for row in self.repository.list_completed_booking_patients_for_batch(user_id=user_id):
+        target_visit_date = self.repository._current_assigned_visit_date()
+
+        for row in self.repository.list_completed_booking_patients_for_batch(
+            user_id=user_id,
+            visit_date=target_visit_date,
+        ):
             add_patient(
                 booking_id=int(row.get("booking_id") or 0),
                 appointment_id=None,
@@ -2715,7 +2720,10 @@ class BookingService:
                 tube_names=self._normalize_tube_names(row.get("cmplt_tube"), row.get("additional_sample")),
             )
 
-        appointment_rows = self.repository.list_completed_appointments_for_batch(user_id=user_id)
+        appointment_rows = self.repository.list_completed_appointments_for_batch(
+            user_id=user_id,
+            visit_date=target_visit_date,
+        )
         appointment_booking_ids = [int(x.get("booking_id") or 0) for x in appointment_rows]
         patient_lookup: dict[tuple[int, int], dict] = {}
         for p in self.repository.list_booking_patients_for_bookings(booking_ids=appointment_booking_ids):
