@@ -3800,7 +3800,8 @@ class BookingRepository:
         ).mappings().all()
         return [dict(x) for x in rows]
 
-    def list_completed_booking_patients_for_batch(self, *, user_id: int) -> list[dict]:
+    def list_completed_booking_patients_for_batch(self, *, user_id: int, visit_date=None) -> list[dict]:
+        target_visit_date = visit_date or self._current_assigned_visit_date()
         rows = self.db.execute(
             text(
                 """
@@ -3817,7 +3818,8 @@ class BookingRepository:
                 JOIN hhome_collection_booking_patient bp ON bp.booking_id = b.id
                 LEFT JOIN hpatient_master pm ON pm.id = bp.patient_id
                 WHERE b.assigned_phlebotomist_id = :user_id
-                  AND b.booking_status = 3
+                  AND b.preferred_visit_date = :target_visit_date
+                  AND b.booking_status IN (3, 5)
                   AND COALESCE(bp.booking_patient_status, 0) = 3
                   AND (
                     NULLIF(TRIM(COALESCE(bp.cmplt_tube, '')), '') IS NOT NULL
@@ -3827,14 +3829,23 @@ class BookingRepository:
                 LIMIT 500
                 """
             ),
-            {"user_id": int(user_id)},
+            {"user_id": int(user_id), "target_visit_date": target_visit_date},
         ).mappings().all()
         return [dict(x) for x in rows]
 
-    def list_completed_appointments_for_batch(self, *, user_id: int) -> list[dict]:
+    def list_completed_appointments_for_batch(self, *, user_id: int, visit_date=None) -> list[dict]:
+        target_visit_date = visit_date or self._current_assigned_visit_date()
+        appointment_cols = self._get_appointment_columns()
+        appointment_date_col = (
+            "preferred_visit_date"
+            if "preferred_visit_date" in appointment_cols
+            else ("visit_date" if "visit_date" in appointment_cols else None)
+        )
+        if appointment_date_col is None:
+            return []
         rows = self.db.execute(
             text(
-                """
+                f"""
                 SELECT
                     b.id AS booking_id,
                     ap.id AS appointment_id,
@@ -3843,13 +3854,14 @@ class BookingRepository:
                 FROM hhome_collection_booking_appointment ap
                 JOIN hhome_collection_booking b ON b.id = ap.booking_id
                 WHERE ap.assigned_phlebotomist_id = :user_id
+                  AND ap.{appointment_date_col} = :target_visit_date
                   AND COALESCE(ap.appointment_status, 0) = 3
                   AND NULLIF(TRIM(COALESCE(ap.cmplt_tube, '')), '') IS NOT NULL
                 ORDER BY ap.id DESC
                 LIMIT 500
                 """
             ),
-            {"user_id": int(user_id)},
+            {"user_id": int(user_id), "target_visit_date": target_visit_date},
         ).mappings().all()
         return [dict(x) for x in rows]
 

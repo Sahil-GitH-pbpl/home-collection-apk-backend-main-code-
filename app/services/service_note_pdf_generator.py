@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import base64
 import json
 import shutil
 import subprocess
@@ -11,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from app.core.config import get_settings
+from app.core.database import CatalogSessionLocal, SessionLocal
+from sqlalchemy import bindparam, text
 from tools.service_note_html import build_service_note_html
 
 
@@ -58,6 +61,15 @@ def _normalize_indian_whatsapp_number(value: object) -> str | None:
     return None
 
 
+def _normalize_local_whatsapp_target(value: object) -> str | None:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if not digits:
+        return None
+    if len(digits) >= 16:
+        return f"{digits}@g.us"
+    return _normalize_indian_whatsapp_number(digits)
+
+
 def _pdf_public_url(booking_key: str) -> str:
     base = str(_settings.apk_public_domain or "").strip().rstrip("/")
     if not base:
@@ -66,8 +78,8 @@ def _pdf_public_url(booking_key: str) -> str:
 
 
 def _patient_whatsapp_targets(payload: dict) -> list[dict[str, str]]:
-    targets: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
+    grouped: dict[str, list[str]] = {}
+    seen_names_by_mobile: dict[str, set[str]] = {}
     for row in (payload.get("sample_collection_pick_patients") or []):
         if not isinstance(row, dict):
             continue
@@ -81,12 +93,273 @@ def _patient_whatsapp_targets(payload: dict) -> list[dict[str, str]]:
         mobile = _normalize_indian_whatsapp_number(row.get("contact_mobile"))
         if not patient_name or not mobile:
             continue
-        key = (patient_name, mobile)
-        if key in seen:
+        seen_names = seen_names_by_mobile.setdefault(mobile, set())
+        if patient_name in seen_names:
+            continue
+        seen_names.add(patient_name)
+        grouped.setdefault(mobile, []).append(patient_name)
+    return [
+        {"patient_name": ", ".join(names), "recipient_whatsapp": mobile}
+        for mobile, names in grouped.items()
+        if names
+    ]
+
+
+def _completed_patient_names(payload: dict) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for row in (payload.get("sample_collection_pick_patients") or []):
+        if not isinstance(row, dict):
+            continue
+        try:
+            booking_patient_status = int(row.get("booking_patient_status") or 0)
+        except (TypeError, ValueError):
+            booking_patient_status = 0
+        if booking_patient_status != 3:
+            continue
+        name = str(row.get("name") or row.get("full_name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def _panel_company_names(payload: dict) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for row in (payload.get("sample_collection_pick_patients") or []):
+        if not isinstance(row, dict):
+            continue
+        try:
+            booking_patient_status = int(row.get("booking_patient_status") or 0)
+        except (TypeError, ValueError):
+            booking_patient_status = 0
+        if booking_patient_status != 3:
+            continue
+        name = str(row.get("panel_company") or "").strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _patient_ref_by_names(payload: dict) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for row in (payload.get("patient_updates") or []):
+        if not isinstance(row, dict):
+            continue
+        try:
+            booking_patient_status = int(row.get("booking_patient_status") or 0)
+        except (TypeError, ValueError):
+            booking_patient_status = 0
+        if booking_patient_status != 3:
+            continue
+        name = str(row.get("ref_by") or row.get("referred_by") or "").strip()
+        key = name.lower()
+        if not name or key in seen:
             continue
         seen.add(key)
-        targets.append({"patient_name": patient_name, "recipient_whatsapp": mobile})
+        names.append(name)
+    return names
+
+
+def _service_note_local_message(payload: dict) -> str:
+    patient_names = ", ".join(_completed_patient_names(payload)) or "Patient"
+    return (
+        f"Hello {patient_names},\n"
+        "Your home sample collection has been completed.\n"
+        "We hope everything went smoothly and that you’re feeling comfortable.\n"
+        "Your samples are being sent to our into our laboratory with utmost care, "
+        "where they are carefully processed, and every report is reviewed by us.\n"
+        "You’ve done your bit — as your doctors, we take it forward from here and "
+        "will get back to you with your reports.\n"
+        "We’ll also be reaching out to understand your experience, as it helps us care"
+    )
+
+
+def _lookup_panel_group_targets(payload: dict) -> list[str]:
+    panel_names = _panel_company_names(payload)
+    if not panel_names:
+        return []
+    targets: list[str] = []
+    seen: set[str] = set()
+    stmt = text(
+        """
+        SELECT DISTINCT OFax
+        FROM address
+        WHERE pname IN :panel_names
+          AND OFax IS NOT NULL
+          AND TRIM(OFax) <> ''
+        """
+    ).bindparams(bindparam("panel_names", expanding=True))
+    db = CatalogSessionLocal()
+    try:
+        for row in db.execute(stmt, {"panel_names": panel_names}).mappings():
+            target = _normalize_local_whatsapp_target(row.get("OFax"))
+            if not target or target in seen:
+                continue
+            seen.add(target)
+            targets.append(target)
+    except Exception:
+        logger.exception("[service note local whatsapp] panel OFax lookup failed panels=%s", panel_names)
+    finally:
+        db.close()
     return targets
+
+
+def _lookup_patient_ref_by_group_targets(payload: dict) -> list[str]:
+    ref_names = _patient_ref_by_names(payload)
+    if not ref_names:
+        return []
+    targets: list[str] = []
+    seen: set[str] = set()
+    stmt = text(
+        """
+        SELECT DISTINCT OFax
+        FROM address
+        WHERE Active = 1
+          AND UPPER(TRIM(Atype)) = 'D'
+          AND OFax IS NOT NULL
+          AND TRIM(OFax) <> ''
+          AND (
+            LOWER(TRIM(pname)) IN :ref_names
+            OR LOWER(TRIM(ABARID)) IN :ref_names
+          )
+        """
+    ).bindparams(bindparam("ref_names", expanding=True))
+    db = CatalogSessionLocal()
+    try:
+        for row in db.execute(stmt, {"ref_names": [name.lower() for name in ref_names]}).mappings():
+            target = _normalize_local_whatsapp_target(row.get("OFax"))
+            if not target or target in seen:
+                continue
+            seen.add(target)
+            targets.append(target)
+    except Exception:
+        logger.exception("[service note local whatsapp] patient ref_by OFax lookup failed refs=%s", ref_names)
+    finally:
+        db.close()
+    return targets
+
+
+def _lookup_internal_ref_targets(payload: dict) -> list[str]:
+    internal_ref = str(payload.get("intrnl_rfrncd_by") or "").strip()
+    if not internal_ref:
+        return []
+    db = SessionLocal()
+    try:
+        if internal_ref.isdigit():
+            row = db.execute(
+                text(
+                    """
+                    SELECT contact
+                    FROM users
+                    WHERE id = :user_id
+                      AND contact IS NOT NULL
+                      AND TRIM(contact) <> ''
+                    LIMIT 1
+                    """
+                ),
+                {"user_id": int(internal_ref)},
+            ).mappings().first()
+        else:
+            row = db.execute(
+                text(
+                    """
+                    SELECT contact
+                    FROM users
+                    WHERE LOWER(TRIM(name)) = LOWER(TRIM(:name))
+                      AND contact IS NOT NULL
+                      AND TRIM(contact) <> ''
+                    ORDER BY id ASC
+                    LIMIT 1
+                    """
+                ),
+                {"name": internal_ref},
+            ).mappings().first()
+        target = _normalize_local_whatsapp_target(row.get("contact") if row else None)
+        return [target] if target else []
+    except Exception:
+        logger.exception("[service note local whatsapp] internal ref lookup failed value=%s", internal_ref)
+        return []
+    finally:
+        db.close()
+
+
+def _local_whatsapp_targets(payload: dict) -> list[str]:
+    targets: list[str] = []
+    seen: set[str] = set()
+    for target in (
+        _lookup_panel_group_targets(payload)
+        + _lookup_patient_ref_by_group_targets(payload)
+        + _lookup_internal_ref_targets(payload)
+    ):
+        if not target or target in seen:
+            continue
+        seen.add(target)
+        targets.append(target)
+    return targets
+
+
+def _send_service_note_local_whatsapp(payload: dict, booking_key: str, pdf_path: Path) -> None:
+    if not _settings.local_whatsapp_enabled:
+        logger.info("[service note local whatsapp] disabled booking_id=%s", booking_key)
+        return
+    api_url = str(_settings.local_whatsapp_api_url or "").strip()
+    if not api_url:
+        logger.info("[service note local whatsapp] api url missing; skipped booking_id=%s", booking_key)
+        return
+    if not pdf_path.exists():
+        logger.info("[service note local whatsapp] pdf missing; skipped booking_id=%s pdf=%s", booking_key, pdf_path)
+        return
+
+    targets = _local_whatsapp_targets(payload)
+    if not targets:
+        logger.info("[service note local whatsapp] no extra recipients booking_id=%s", booking_key)
+        return
+
+    message = _service_note_local_message(payload)
+    pdf_data = base64.b64encode(pdf_path.read_bytes()).decode("ascii")
+    timeout = int(_settings.pepipost_wa_timeout or 8)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    for target in targets:
+        request_payload = {
+            "accountId": int(_settings.local_whatsapp_account_id or 1),
+            "target": target,
+            "message": message,
+            "media": {
+                "data": pdf_data,
+                "mimetype": "application/pdf",
+                "filename": pdf_path.name,
+            },
+        }
+        data = json.dumps(request_payload).encode("utf-8")
+        request = urllib.request.Request(
+            api_url,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8", errors="replace")
+                logger.info(
+                    "[service note local whatsapp] sent booking_id=%s target=%s status=%s response=%s",
+                    booking_key,
+                    target,
+                    response.status,
+                    body,
+                )
+        except Exception:
+            logger.exception(
+                "[service note local whatsapp] failed booking_id=%s target=%s pdf=%s",
+                booking_key,
+                target,
+                pdf_path,
+            )
 
 
 def _send_service_note_whatsapp(payload: dict, booking_key: str, pdf_path: Path) -> None:
@@ -234,6 +507,7 @@ def _run_generation_job(payload: dict, booking_key: str) -> None:
         pdf_path = generate_service_note_pdf(payload, booking_key)
         logger.info("[service note pdf] generated booking_id=%s pdf=%s", booking_key, pdf_path)
         _send_service_note_whatsapp(payload, booking_key, pdf_path)
+        _send_service_note_local_whatsapp(payload, booking_key, pdf_path)
         _cleanup_service_note_html(booking_key)
     except Exception:
         logger.exception("[service note pdf] generation failed booking_id=%s", booking_key)

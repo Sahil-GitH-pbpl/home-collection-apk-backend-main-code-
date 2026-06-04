@@ -83,7 +83,7 @@ Copy-Item .env.example .env
 
 (or update `SSL_CERT_FILE` and `SSL_KEY_FILE` in `.env`)
 
-## Run HTTPS API on Port 2010
+## Run HTTPS API on Port 2015
 
 ```powershell
 py apk.py
@@ -91,7 +91,7 @@ py apk.py
 
 Server URL:
 
-- `https://localhost:2010`
+- `https://localhost:2015`
 
 ## API Endpoints
 
@@ -160,12 +160,12 @@ Server URL:
 
 ### Add Patient Curl
 ```cmd
-curl.exe -X POST "https://labmate.bhasinpathlabs.com:2010/api/v1/bookings/my-assigned/11/patients" -H "Content-Type: application/json" -H "Authorization: Bearer <ACCESS_TOKEN>" -d "{\"title\":\"Mr\",\"full_name\":\"Test Patient\",\"gender\":\"Male\",\"date_of_birth\":\"2000-01-01\",\"age_years\":25,\"primary_mobile\":\"9898989898\",\"alternate_mobile\":\"9797979797\",\"email\":\"a@b.com\",\"labmate_pid\":\"1000000\",\"panel_company\":\"CGHS\",\"tag\":\"VIP\"}"
+curl.exe -X POST "https://labmate.bhasinpathlabs.com:2015/api/v1/bookings/my-assigned/11/patients" -H "Content-Type: application/json" -H "Authorization: Bearer <ACCESS_TOKEN>" -d "{\"title\":\"Mr\",\"full_name\":\"Test Patient\",\"gender\":\"Male\",\"date_of_birth\":\"2000-01-01\",\"age_years\":25,\"primary_mobile\":\"9898989898\",\"alternate_mobile\":\"9797979797\",\"email\":\"a@b.com\",\"labmate_pid\":\"1000000\",\"panel_company\":\"CGHS\",\"tag\":\"VIP\"}"
 ```
 
 ### Edit Patient Curl
 ```cmd
-curl.exe -X PUT "https://labmate.bhasinpathlabs.com:2010/api/v1/bookings/my-assigned/3/patients/5" -H "Content-Type: application/json" -H "Authorization: Bearer <ACCESS_TOKEN>" -d "{\"full_name\":\"Updated Patient\",\"primary_mobile\":\"9999999999\",\"alternate_mobile\":\"8888888888\",\"panel_company\":\"CGHS\",\"tag\":\"VIP\"}"
+curl.exe -X PUT "https://labmate.bhasinpathlabs.com:2015/api/v1/bookings/my-assigned/3/patients/5" -H "Content-Type: application/json" -H "Authorization: Bearer <ACCESS_TOKEN>" -d "{\"full_name\":\"Updated Patient\",\"primary_mobile\":\"9999999999\",\"alternate_mobile\":\"8888888888\",\"panel_company\":\"CGHS\",\"tag\":\"VIP\"}"
 ```
 
 ## Auth Header
@@ -180,5 +180,5 @@ Authorization: Bearer <token>
 - Panel/test lite APIs use separate DB `CATALOG_MYSQL_DB` (default `bhasin_7001`).
 - No child/tube enrichment is performed.
 - New login invalidates any older token for the same user.
-- Special note: Current setup is for testing with direct HTTPS app run on port `2010` (`py apk.py`).
+- Special note: Current setup is for testing with direct HTTPS app run on port `2015` (`py apk.py`).
 - Special note: For production/live deployment, keep Nginx as a separate reverse-proxy layer (domain/SSL at Nginx, app on internal port).
