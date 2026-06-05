@@ -1,9 +1,10 @@
-﻿import json
+import json
 
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import ValidationError
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.requests import ClientDisconnect
@@ -47,6 +48,33 @@ def _user_label(user: User) -> str:
     return f"{user.id}:{user.name}"
 
 
+def _clean_text(value) -> str | None:
+    text_value = str(value or "").strip()
+    return text_value or None
+
+
+def _to_float(value) -> float:
+    try:
+        return float(value or 0)
+    except Exception:
+        return 0.0
+
+
+def _snapshot_test_names(node) -> list[str]:
+    sections = (node or {}).get("panels") if isinstance(node, dict) else None
+    sections = sections if isinstance(sections, list) and sections else [node or {}]
+    out: list[str] = []
+    seen: set[str] = set()
+    for sec in sections:
+        for item in ((sec or {}).get("selected_tests") or []):
+            name = _clean_text((item or {}).get("description") or (item or {}).get("test_name") or (item or {}).get("booked_code"))
+            key = (name or "").lower()
+            if name and key not in seen:
+                seen.add(key)
+                out.append(name)
+    return out
+
+
 @router.get("/my-assigned", response_model=list[BookingSummary])
 def get_my_assigned_bookings(
     limit: int = 50,
@@ -75,6 +103,164 @@ def get_my_assigned_history_bookings(
         limit=limit,
         offset=offset,
     )
+
+
+@router.get("/my-assigned/history/detail")
+def get_my_assigned_history_detail(
+    source_type: str = "BOOKING",
+    booking_id: int = 0,
+    appointment_id: int | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    src = (source_type or "BOOKING").strip().upper()
+    if src not in {"BOOKING", "APPOINTMENT"}:
+        raise HTTPException(status_code=400, detail="source_type must be BOOKING or APPOINTMENT")
+    if booking_id <= 0:
+        raise HTTPException(status_code=400, detail="booking_id is required")
+
+    selected_ids: set[int] | None = None
+    completed: dict[int, list[str]] = {}
+    cancelled: dict[int, list[str]] = {}
+    appt_pay: dict[int, dict] = {}
+    if src == "APPOINTMENT":
+        if not appointment_id:
+            raise HTTPException(status_code=400, detail="appointment_id is required for APPOINTMENT")
+        appt = db.execute(
+            text(
+                """
+                SELECT booking_id, appointment_status, selected_patient_ids_json,
+                       appointment_tests_snapshot_json, payment_snapshot_json
+                FROM hhome_collection_booking_appointment
+                WHERE id=:appointment_id
+                  AND booking_id=:booking_id
+                  AND assigned_phlebotomist_id=:user_id
+                  AND COALESCE(appointment_status, 0) IN (3, 4, 5)
+                LIMIT 1
+                """
+            ),
+            {"appointment_id": int(appointment_id), "booking_id": int(booking_id), "user_id": int(current_user.id)},
+        ).mappings().first()
+        if not appt:
+            raise HTTPException(status_code=404, detail="Completed appointment not found")
+        try:
+            selected_ids = {int(x) for x in json.loads(appt.get("selected_patient_ids_json") or "[]") if str(x).isdigit()}
+        except Exception:
+            selected_ids = set()
+        try:
+            snap = json.loads(appt.get("appointment_tests_snapshot_json") or "{}")
+        except Exception:
+            snap = {}
+        for key, node in ((snap.get("tests_billing_map") or {}) if isinstance(snap, dict) else {}).items():
+            if str(key).isdigit():
+                completed[int(key)] = _snapshot_test_names(node)
+
+        try:
+            pay_snap = json.loads(appt.get("payment_snapshot_json") or "{}")
+        except Exception:
+            pay_snap = {}
+        for row in (pay_snap.get("payments") or []):
+            if isinstance(row, dict) and str(row.get("patient_id") or "").isdigit():
+                appt_pay[int(row.get("patient_id"))] = row
+        status_value = appt.get("appointment_status")
+    else:
+        booking = db.execute(
+            text(
+                """
+                SELECT id, booking_status
+                FROM hhome_collection_booking
+                WHERE id=:booking_id
+                  AND assigned_phlebotomist_id=:user_id
+                  AND booking_status IN (3, 4, 5)
+                LIMIT 1
+                """
+            ),
+            {"booking_id": int(booking_id), "user_id": int(current_user.id)},
+        ).mappings().first()
+        if not booking:
+            raise HTTPException(status_code=404, detail="Completed booking not found")
+        status_value = booking.get("booking_status")
+        for row in db.execute(
+            text(
+                """
+                SELECT patient_id, test_name, booked_code, test_status
+                FROM hhome_collection_booking_patient_test
+                WHERE booking_id=:booking_id
+                ORDER BY id ASC
+                """
+            ),
+            {"booking_id": int(booking_id)},
+        ).mappings():
+            pid = int(row.get("patient_id") or 0)
+            name = _clean_text(row.get("test_name") or row.get("booked_code"))
+            if not pid or not name:
+                continue
+            bucket = cancelled if str(row.get("test_status") or "").strip().lower() in {"2", "dropped", "cancelled", "canceled"} else completed
+            bucket.setdefault(pid, [])
+            if name not in bucket[pid]:
+                bucket[pid].append(name)
+
+    patient_rows = db.execute(
+        text(
+            """
+        SELECT
+            bp.id AS booking_patient_id,
+            bp.patient_id,
+            bp.booking_patient_status,
+            bp.APK_TBS AS apk_tbs,
+            bp.ref_by,
+            bp.report_delivery,
+            bp.report_schedule,
+            bp.payment_mode,
+            bp.payment_amount,
+            TRIM(CONCAT(COALESCE(p.title, ''), ' ', COALESCE(p.full_name, ''))) AS patient_name
+        FROM hhome_collection_booking_patient bp
+        LEFT JOIN hpatient_master p ON p.id = bp.patient_id
+        WHERE bp.booking_id=:booking_id
+        ORDER BY bp.id ASC
+            """
+        ),
+        {"booking_id": int(booking_id)},
+    ).mappings().all()
+
+    patients = []
+    for row in patient_rows:
+        pid = int(row.get("patient_id") or 0)
+        if selected_ids is not None and selected_ids and pid not in selected_ids:
+            continue
+        pay = appt_pay.get(pid) if src == "APPOINTMENT" else None
+        patient_status = int(row.get("booking_patient_status") or 0)
+        patient_completed = list(completed.get(pid, []))
+        patient_cancelled = list(cancelled.get(pid, []))
+        if patient_status == 4:
+            merged_cancelled: list[str] = []
+            for name in patient_cancelled + patient_completed:
+                if name not in merged_cancelled:
+                    merged_cancelled.append(name)
+            patient_completed = []
+            patient_cancelled = merged_cancelled
+        patients.append(
+            {
+                "patient_name": _clean_text(row.get("patient_name")),
+                "booking_patient_status": patient_status,
+                "apk_tbs": _clean_text(row.get("apk_tbs")),
+                "ref_by": _clean_text(row.get("ref_by")),
+                "report_delivery": _clean_text(row.get("report_delivery")),
+                "report_schedule": _clean_text(row.get("report_schedule")),
+                "payment_mode": _clean_text((pay or {}).get("payment_mode") if pay else row.get("payment_mode")),
+                "payment_amount": _to_float((pay or {}).get("payment_amount") if pay else row.get("payment_amount")),
+                "completed_tests": patient_completed,
+                "cancelled_tests": patient_cancelled,
+            }
+        )
+
+    return {
+        "source_type": src,
+        "booking_id": int(booking_id),
+        "appointment_id": int(appointment_id) if src == "APPOINTMENT" and appointment_id else None,
+        "booking_status": int(status_value or 0),
+        "patients": patients,
+    }
 
 
 @router.get("/my-assigned/{booking_id}", response_model=BookingDetailsResponse)
