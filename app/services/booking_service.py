@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 from datetime import date, datetime
 import json
 import logging
@@ -2443,39 +2443,86 @@ class BookingService:
         credit_amount = 0.0
         paying_amount = 0.0
 
+        existing_panel_rows = self.repository.db.execute(
+            text(
+                """
+                SELECT patient_id, selected_comp_cat_ids, selected_charge_modes, selected_panel_companies
+                FROM hhome_collection_booking_patient
+                WHERE booking_id=:booking_id
+                """
+            ),
+            {"booking_id": int(booking_id)},
+        ).mappings().all()
+        existing_panel_map: dict[int, dict] = {}
+        for row in existing_panel_rows:
+            pid = int(row.get("patient_id") or 0)
+            comp_ids = [self._as_str(x) for x in self._split_csv_values(row.get("selected_comp_cat_ids"))]
+            modes = [self._as_str(x).upper() if self._as_str(x) else "" for x in self._split_csv_values(row.get("selected_charge_modes"))]
+            names = [self._as_str(x) for x in self._split_csv_values(row.get("selected_panel_companies"))]
+            by_name_mode: dict[tuple[str, str], str] = {}
+            by_name: dict[str, str] = {}
+            for idx, comp in enumerate(comp_ids):
+                name = names[idx] if idx < len(names) else ""
+                mode_val = modes[idx] if idx < len(modes) else ""
+                name_key = str(name or "").strip().lower()
+                mode_key = str(mode_val or "").strip().upper()
+                if name_key and comp:
+                    if mode_key:
+                        by_name_mode.setdefault((name_key, mode_key), comp)
+                    by_name.setdefault(name_key, comp)
+            existing_panel_map[pid] = {"by_name_mode": by_name_mode, "by_name": by_name}
+
         for p in (payload.tests_payload or []):
             patient_id = int(p.patient_id)
             panel_comp_ids: list[str] = []
             panel_modes: list[str] = []
             panel_names: list[str] = []
+            seen_panel_keys: set[tuple[str, str, str]] = set()
+            patient_existing = existing_panel_map.get(patient_id) or {}
             for panel in (p.panels or []):
-                comp_cat_id = (panel.comp_cat_id or "").strip()
+                incoming_comp_cat_id = (panel.comp_cat_id or "").strip()
                 selected_mode = (panel.selected_charge_mode or "").strip().upper()
                 panel_name = (panel.panel_company or "").strip()
-                if comp_cat_id and comp_cat_id not in panel_comp_ids:
+                panel_key_name = panel_name.lower()
+                comp_cat_id = (
+                    (patient_existing.get("by_name_mode") or {}).get((panel_key_name, selected_mode))
+                    or (patient_existing.get("by_name") or {}).get(panel_key_name)
+                    or incoming_comp_cat_id
+                )
+                panel_key = (panel_key_name, comp_cat_id, selected_mode)
+                if comp_cat_id and panel_key not in seen_panel_keys:
+                    seen_panel_keys.add(panel_key)
                     panel_comp_ids.append(comp_cat_id)
                     panel_modes.append(selected_mode)
                     panel_names.append(panel_name)
+                is_free_mode = selected_mode == "F"
                 for t in (panel.selected_tests or []):
                     booked_code = str(t.booked_code or "").strip().upper()
                     if not booked_code:
                         continue
-                    mrp = float(t.mrp or 0)
-                    max_discount = float(t.max_discount or 0)
-                    max_allowed = float(t.max_allowed_discount or 0)
-                    if max_allowed <= 0:
-                        max_allowed = self._max_allowed_discount_from_panelrates(catalog_db, comp_cat_id, booked_code, mrp)
-                    if max_allowed < max_discount:
-                        max_allowed = max_discount
+                    if is_free_mode:
+                        mrp = 0.0
+                        max_discount = 0.0
+                        max_allowed = 0.0
+                        charge = 0.0
+                    else:
+                        mrp = float(t.mrp or 0)
+                        max_discount = float(t.max_discount or 0)
+                        max_allowed = float(t.max_allowed_discount or 0)
+                        if max_allowed <= 0:
+                            max_allowed = self._max_allowed_discount_from_panelrates(catalog_db, comp_cat_id, booked_code, mrp)
+                        if max_allowed < max_discount:
+                            max_allowed = max_discount
+                        charge = float(t.charge or 0)
                     subtotal += mrp
                     base_discount += max_discount
                     max_total_discount += max_allowed
                     desired_rows.append({
                         "patient_id": patient_id,
-                        "comp_cat_id": panel.comp_cat_id,
+                        "comp_cat_id": comp_cat_id,
                         "booked_code": booked_code,
                         "test_name": t.description,
-                        "charge": float(t.charge or 0),
+                        "charge": charge,
                         "mrp": mrp,
                         "max_discount": max_discount,
                     })
