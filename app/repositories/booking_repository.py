@@ -1,4 +1,6 @@
 import json
+import shutil
+from pathlib import Path
 from datetime import datetime, time, timedelta
 from collections import defaultdict
 from threading import Lock
@@ -10,6 +12,7 @@ from sqlalchemy import bindparam, func
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.models.booking import (
     CallerMaster,
     HomeCollectionBooking,
@@ -37,6 +40,8 @@ class BookingRepository:
             "hhome_collection_booking_patient",
             "hhome_collection_booking_patient_test",
             "hpatient_master",
+            "tickets",
+            "users",
         }:
             raise ValueError(f"Unsupported table name: {table_name}")
         cached_columns = BookingRepository._shared_table_columns_cache.get(table_name)
@@ -1542,7 +1547,269 @@ class BookingRepository:
             },
         )
 
-    def cancel_booking_with_lead(
+    def _upload_root(self) -> Path:
+        return Path(get_settings().patient_documents_upload_base).resolve().parent
+
+    @staticmethod
+    def _split_csv_paths(raw: str | None) -> list[str]:
+        return [str(x or "").strip() for x in str(raw or "").split(",") if str(x or "").strip()]
+
+    def _copy_cancel_reschedule_docs(
+        self,
+        *,
+        old_booking_code: str,
+        new_booking_code: str,
+        patient_id: int,
+        prescription_files: str | None,
+        patient_photo_files: str | None,
+    ) -> tuple[str | None, str | None]:
+        old_code = str(old_booking_code or "").strip()
+        new_code = str(new_booking_code or "").strip()
+        if not old_code or not new_code or int(patient_id or 0) <= 0:
+            return None, None
+
+        upload_root = self._upload_root()
+        prescription_root = upload_root / "prescriptions"
+        photo_root = upload_root / "booking_patient_documents"
+
+        new_prescriptions: list[str] = []
+        prescription_dst_dir = prescription_root / new_code
+        prescription_dst_dir.mkdir(parents=True, exist_ok=True)
+        for idx, rel in enumerate(self._split_csv_paths(prescription_files), start=1):
+            src = prescription_root / rel
+            ext = src.suffix or Path(rel).suffix or ".pdf"
+            dst_name = f"{new_code}_PT{int(patient_id)}_{idx}{ext}"
+            dst = prescription_dst_dir / dst_name
+            if src.exists():
+                shutil.copy2(src, dst)
+                new_prescriptions.append(f"{new_code}/{dst_name}")
+
+        new_photos: list[str] = []
+        photo_dst_dir = photo_root / new_code / f"PT{int(patient_id)}"
+        photo_dst_dir.mkdir(parents=True, exist_ok=True)
+        for idx, rel in enumerate(self._split_csv_paths(patient_photo_files), start=1):
+            src = photo_root / rel
+            ext = src.suffix or Path(rel).suffix or ".jpg"
+            dst_name = f"{new_code}_PT{int(patient_id)}_PHOTO_{idx}{ext}"
+            dst = photo_dst_dir / dst_name
+            if src.exists():
+                shutil.copy2(src, dst)
+                new_photos.append(f"{new_code}/PT{int(patient_id)}/{dst_name}")
+
+        return (
+            ",".join(new_prescriptions) if new_prescriptions else None,
+            ",".join(new_photos) if new_photos else None,
+        )
+
+    def _create_cancel_reschedule_booking(
+        self,
+        *,
+        source_booking: dict,
+        proposed_visit_date: str,
+        proposed_time_slot: str,
+        actor_user_id: int,
+    ) -> dict:
+        booking_id = int(source_booking.get("id") or 0)
+        booking_cols = self._get_table_columns("hhome_collection_booking")
+        patient_cols = self._get_table_columns("hhome_collection_booking_patient")
+
+        cols = [
+            "booking_code", "caller_id", "selected_address_id", "address_snapshot_json",
+            "preferred_visit_date", "preferred_time_slot", "booking_status",
+            "assigned_phlebotomist_id", "F_Apt_Am", "credit_amount", "paying_amount",
+            "F_dis", "Ad_dis", "total_amount", "created_by",
+        ]
+        vals = [f":{c}" for c in cols]
+        params = {
+            "booking_code": f"HC-PENDING-{booking_id}",
+            "caller_id": source_booking.get("caller_id"),
+            "selected_address_id": source_booking.get("selected_address_id"),
+            "address_snapshot_json": source_booking.get("address_snapshot_json") or "{}",
+            "preferred_visit_date": proposed_visit_date,
+            "preferred_time_slot": proposed_time_slot,
+            "booking_status": 0,
+            "assigned_phlebotomist_id": None,
+            "F_Apt_Am": float(source_booking.get("F_Apt_Am") or 0),
+            "credit_amount": float(source_booking.get("credit_amount") or 0),
+            "paying_amount": float(source_booking.get("paying_amount") or 0),
+            "F_dis": float(source_booking.get("F_dis") or 0),
+            "Ad_dis": float(source_booking.get("Ad_dis") or 0),
+            "total_amount": float(source_booking.get("total_amount") or 0),
+            "created_by": int(actor_user_id),
+        }
+        if "bkg_ref_flag" in booking_cols:
+            cols.append("bkg_ref_flag")
+            vals.append(":bkg_ref_flag")
+            params["bkg_ref_flag"] = booking_id
+
+        ins = self.db.execute(text(f"INSERT INTO hhome_collection_booking ({', '.join(cols)}) VALUES ({', '.join(vals)})"), params)
+        new_booking_id = int(ins.lastrowid or 0)
+        new_booking_code = f"HC26-{new_booking_id}"
+        self.db.execute(
+            text("UPDATE hhome_collection_booking SET booking_code=:booking_code WHERE id=:booking_id"),
+            {"booking_code": new_booking_code, "booking_id": new_booking_id},
+        )
+
+        patients = self.db.execute(
+            text("SELECT * FROM hhome_collection_booking_patient WHERE booking_id=:booking_id"),
+            {"booking_id": booking_id},
+        ).mappings().all()
+        for bp in patients:
+            patient_id = int(bp.get("patient_id") or 0)
+            if patient_id <= 0:
+                continue
+            bp_cols = ["booking_id", "patient_id", "booking_patient_status", "created_by"]
+            bp_vals = [":booking_id", ":patient_id", ":booking_patient_status", ":created_by"]
+            bp_params = {
+                "booking_id": new_booking_id,
+                "patient_id": patient_id,
+                "booking_patient_status": 0,
+                "created_by": int(actor_user_id),
+            }
+            for col in (
+                "cce_level_TBS", "ref_by", "selected_comp_cat_ids", "selected_cat_details",
+                "selected_charge_modes", "selected_panel_companies", "patient_final_amount",
+                "additional_discount_amount",
+            ):
+                if col in patient_cols:
+                    bp_cols.append(col)
+                    bp_vals.append(f":{col}")
+                    bp_params[col] = bp.get(col)
+
+            new_prescriptions, new_photos = self._copy_cancel_reschedule_docs(
+                old_booking_code=str(source_booking.get("booking_code") or ""),
+                new_booking_code=new_booking_code,
+                patient_id=patient_id,
+                prescription_files=bp.get("prescription_files"),
+                patient_photo_files=bp.get("patient_photo_files"),
+            )
+            if "prescription_files" in patient_cols:
+                bp_cols.append("prescription_files")
+                bp_vals.append(":prescription_files")
+                bp_params["prescription_files"] = new_prescriptions
+            if "patient_photo_files" in patient_cols:
+                bp_cols.append("patient_photo_files")
+                bp_vals.append(":patient_photo_files")
+                bp_params["patient_photo_files"] = new_photos
+
+            bp_ins = self.db.execute(
+                text(f"INSERT INTO hhome_collection_booking_patient ({', '.join(bp_cols)}) VALUES ({', '.join(bp_vals)})"),
+                bp_params,
+            )
+            new_bp_id = int(bp_ins.lastrowid or 0)
+
+            tests = self.db.execute(
+                text(
+                    """
+                    SELECT comp_cat_id, booked_code, test_name, charge, mrp, max_discount
+                    FROM hhome_collection_booking_patient_test
+                    WHERE booking_id=:booking_id AND patient_id=:patient_id
+                      AND (test_status IS NULL OR TRIM(test_status)='' OR test_status='0' OR UPPER(TRIM(test_status))='PENDING')
+                    """
+                ),
+                {"booking_id": booking_id, "patient_id": patient_id},
+            ).mappings().all()
+            for t in tests:
+                self.db.execute(
+                    text(
+                        """
+                        INSERT INTO hhome_collection_booking_patient_test
+                        (booking_id, booking_patient_id, patient_id, comp_cat_id, booked_code, test_name, charge, mrp, max_discount, test_status, created_by)
+                        VALUES (:booking_id, :booking_patient_id, :patient_id, :comp_cat_id, :booked_code, :test_name, :charge, :mrp, :max_discount, '0', :created_by)
+                        """
+                    ),
+                    {
+                        "booking_id": new_booking_id,
+                        "booking_patient_id": new_bp_id,
+                        "patient_id": patient_id,
+                        "comp_cat_id": t.get("comp_cat_id"),
+                        "booked_code": t.get("booked_code"),
+                        "test_name": t.get("test_name"),
+                        "charge": float(t.get("charge") or 0),
+                        "mrp": float(t.get("mrp") or 0),
+                        "max_discount": float(t.get("max_discount") or 0),
+                        "created_by": int(actor_user_id),
+                    },
+                )
+
+        return {"booking_id": new_booking_id, "booking_code": new_booking_code}
+
+    def _create_cancel_odt_ticket(
+        self,
+        *,
+        booking_id: int,
+        actor_user_id: int,
+        reason_text: str,
+        remark: str | None,
+        caller_mobile: str,
+        patient_names: str,
+    ) -> int | None:
+        user_row = self.db.execute(
+            text("SELECT name, designation FROM users WHERE id=:id LIMIT 1"),
+            {"id": int(actor_user_id or 0)},
+        ).mappings().first() or {}
+        patient_ref = self.db.execute(
+            text(
+                """
+                SELECT p.patient_code, p.labmate_pid
+                FROM hhome_collection_booking_patient bp
+                LEFT JOIN hpatient_master p ON p.id=bp.patient_id
+                WHERE bp.booking_id=:booking_id
+                ORDER BY bp.id ASC
+                LIMIT 1
+                """
+            ),
+            {"booking_id": int(booking_id)},
+        ).mappings().first() or {}
+        labmate_id = str(patient_ref.get("labmate_pid") or patient_ref.get("patient_code") or "").strip() or None
+        remark_txt = str(remark or "").strip()
+        additional_info = "\n".join(
+            [
+                f"Booking ID: {int(booking_id)}",
+                f"Cancel Reason: {str(reason_text or '').strip()}",
+                f"Remark: {remark_txt}",
+                f"Caller Mobile: {str(caller_mobile or '').strip()}",
+                f"Patients: {str(patient_names or '').strip()}",
+            ]
+        )
+        ins = self.db.execute(
+            text(
+                """
+                INSERT INTO tickets
+                (source, country_code, mobile_number, patient_name, patient_labmate_id,
+                 client_name, priority, whatsapp_opt_in, ticket_category, commitment_at,
+                 assign_to_user_id, assignment_reason, tags_json, additional_info,
+                 status, created_by, designation, created_at, ticket_origin)
+                VALUES (:source, :country_code, :mobile_number, :patient_name, :patient_labmate_id,
+                 :client_name, :priority, :whatsapp_opt_in, :ticket_category, DATE_ADD(NOW(), INTERVAL 2 HOUR),
+                 :assign_to_user_id, :assignment_reason, :tags_json, :additional_info,
+                 :status, :created_by, :designation, NOW(), :ticket_origin)
+                """
+            ),
+            {
+                "source": "patient",
+                "country_code": "+91",
+                "mobile_number": str(caller_mobile or "").strip() or None,
+                "patient_name": str(patient_names or "").strip() or None,
+                "patient_labmate_id": labmate_id,
+                "client_name": None,
+                "priority": "High",
+                "whatsapp_opt_in": 0,
+                "ticket_category": "HC Phlebo Status",
+                "assign_to_user_id": None,
+                "assignment_reason": None,
+                "tags_json": "[]",
+                "additional_info": additional_info,
+                "status": "Open",
+                "created_by": str(user_row.get("name") or actor_user_id or "system"),
+                "designation": str(user_row.get("designation") or "").strip() or None,
+                "ticket_origin": "ODT",
+            },
+        )
+        ticket_id = int(ins.lastrowid or 0)
+        return ticket_id or None
+
+    def cancel_booking_with_reschedule_action(
         self,
         booking_id: int,
         actor_user_id: int,
@@ -1561,7 +1828,9 @@ class BookingRepository:
         booking = self.db.execute(
             text(
                 """
-                SELECT id, booking_code, caller_id, booking_status, preferred_visit_date, preferred_time_slot
+                SELECT id, booking_code, caller_id, selected_address_id, address_snapshot_json,
+                       booking_status, preferred_visit_date, preferred_time_slot,
+                       F_Apt_Am, credit_amount, paying_amount, F_dis, Ad_dis, total_amount
                 FROM hhome_collection_booking
                 WHERE id=:booking_id
                 LIMIT 1
@@ -1576,6 +1845,17 @@ class BookingRepository:
         status_now = int(booking.get("booking_status") or 0)
         if status_now in {3, 4}:
             raise ValueError("Completed/Cancelled booking cannot be cancelled")
+
+        proposed_date_norm = str(proposed_visit_date or "").strip()
+        proposed_slot_norm = str(proposed_time_slot or "").strip()
+        created_reschedule_booking = None
+        if bool(reschedule_requested) and proposed_date_norm and proposed_slot_norm:
+            created_reschedule_booking = self._create_cancel_reschedule_booking(
+                source_booking=dict(booking),
+                proposed_visit_date=proposed_date_norm,
+                proposed_time_slot=proposed_slot_norm,
+                actor_user_id=int(actor_user_id),
+            )
 
         self.db.execute(
             text("UPDATE hhome_collection_booking SET booking_status=4 WHERE id=:booking_id"),
@@ -1605,6 +1885,7 @@ class BookingRepository:
 
         lead_created = False
         lead_id = None
+        odt_ticket_id = None
 
         lead_meta = self.db.execute(
             text(
@@ -1628,43 +1909,15 @@ class BookingRepository:
         patient_count = int(lead_meta.get("patient_count") or 0)
         remark_txt = str(remark or "").strip()
 
-        res_note = "Reschedule not requested."
-        if bool(reschedule_requested):
-            if (proposed_visit_date or "").strip() and (proposed_time_slot or "").strip():
-                res_note = f"Reschedule requested for {str(proposed_visit_date).strip()} {str(proposed_time_slot).strip()}."
-            else:
-                res_note = "Reschedule requested; date/slot to be finalized."
-
-        lead_summary = f"This was a Home Collection booking cancelled due to {reason}. {res_note}"
-        if remark_txt:
-            lead_summary = f"{lead_summary} Remark: {remark_txt}"
-
-        if bool(reschedule_requested) and mobile:
-            self.db.execute(
-                text(
-                    """
-                    INSERT INTO leads
-                    (phone, wa_only, name, alt_phone, alt_wa_only, visit_window, prescription, remarks, tags, num_patients, created_by, status)
-                    VALUES (:phone, 0, :name, '', 0, 'Flexible', '', :remarks, 'home_collection_cancel', :num_patients, :created_by, 'Open')
-                    """
-                ),
-                {
-                    "phone": mobile,
-                    "name": patient_names or "Home Collection Cancellation",
-                    "remarks": lead_summary,
-                    "num_patients": max(1, patient_count),
-                    "created_by": str(actor_user_id),
-                },
+        if bool(reschedule_requested) and not (proposed_date_norm and proposed_slot_norm):
+            odt_ticket_id = self._create_cancel_odt_ticket(
+                booking_id=int(booking_id),
+                actor_user_id=int(actor_user_id),
+                reason_text=reason,
+                remark=remark_txt,
+                caller_mobile=mobile,
+                patient_names=patient_names,
             )
-            new_id_row = self.db.execute(text("SELECT LAST_INSERT_ID() AS lid")).mappings().first() or {}
-            new_pk = int(new_id_row.get("lid") or 0)
-            if new_pk > 0:
-                lead_id = f"LD-{new_pk:03d}"
-                self.db.execute(
-                    text("UPDATE leads SET lead_id=:lead_id WHERE id=:id"),
-                    {"lead_id": lead_id, "id": new_pk},
-                )
-                lead_created = True
 
         self._insert_booking_action_audit(
             booking_id=int(booking_id),
@@ -1682,6 +1935,9 @@ class BookingRepository:
                 "proposed_time_slot": str(proposed_time_slot or "").strip() or None,
                 "lead_created": lead_created,
                 "lead_id": lead_id,
+                "rescheduled_booking_id": (created_reschedule_booking or {}).get("booking_id"),
+                "rescheduled_booking_code": (created_reschedule_booking or {}).get("booking_code"),
+                "odt_ticket_id": odt_ticket_id,
             },
             done_by=int(actor_user_id),
         )
