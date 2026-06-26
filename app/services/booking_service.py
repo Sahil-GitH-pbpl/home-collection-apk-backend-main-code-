@@ -1121,6 +1121,97 @@ class BookingService:
         lock_wait_ms = 0.0
         tests_phase_ms = 0.0
         uploads_phase_started_at = 0.0
+        booking_complete_audit_context: dict | None = None
+
+        def _audit_patient_rows(patient_ids: list[int] | None) -> dict[int, dict]:
+            if not patient_ids:
+                return {}
+            rows = self.repository.db.execute(
+                text(
+                    """
+                    SELECT bp.patient_id,
+                           bp.booking_patient_status,
+                           TRIM(CONCAT_WS(' ', NULLIF(TRIM(COALESCE(p.title, '')), ''), NULLIF(TRIM(COALESCE(p.full_name, '')), ''))) AS patient_name
+                    FROM hhome_collection_booking_patient bp
+                    INNER JOIN hpatient_master p ON p.id = bp.patient_id
+                    WHERE bp.booking_id = :booking_id
+                      AND bp.patient_id IN :patient_ids
+                    """
+                ).bindparams(bindparam("patient_ids", expanding=True)),
+                {"booking_id": int(booking.id), "patient_ids": [int(x) for x in patient_ids]},
+            ).mappings().all()
+            return {
+                int(row.get("patient_id") or 0): {
+                    "patient_name": self._as_str(row.get("patient_name")) or f"Patient {int(row.get('patient_id') or 0)}",
+                    "booking_patient_status": int(row.get("booking_patient_status") or 0),
+                }
+                for row in rows
+                if int(row.get("patient_id") or 0) > 0
+            }
+
+        def _desired_tests_map(tests_payload) -> dict[tuple[int, str], dict]:
+            desired: dict[tuple[int, str], dict] = {}
+            for patient_row in (tests_payload or []):
+                try:
+                    patient_id = int(getattr(patient_row, "patient_id", None) or 0)
+                except Exception:
+                    patient_id = 0
+                if patient_id <= 0:
+                    continue
+                for panel in (getattr(patient_row, "panels", None) or []):
+                    for test in (getattr(panel, "selected_tests", None) or []):
+                        booked_code = str(getattr(test, "booked_code", "") or "").strip().upper()
+                        if booked_code:
+                            desired[(patient_id, booked_code)] = {
+                                "booked_code": booked_code,
+                                "test_name": self._as_str(getattr(test, "description", None) or getattr(test, "test_name", None) or booked_code) or booked_code,
+                            }
+            return desired
+
+        def _build_audit_new_values(before_patients: dict[int, dict], before_tests_by_patient: dict[int, list[dict]], desired_tests: dict[tuple[int, str], dict], scope_patient_ids: list[int]) -> dict | None:
+            after_patients = _audit_patient_rows(scope_patient_ids)
+            new_values: dict[str, list[dict]] = {}
+
+            removed_patient_ids = sorted(
+                pid for pid in set(before_patients) | set(after_patients)
+                if before_patients.get(pid, {}).get("booking_patient_status") != 4
+                and after_patients.get(pid, {}).get("booking_patient_status") == 4
+            )
+            if removed_patient_ids:
+                new_values["removed_patients"] = [
+                    {"patient_name": (after_patients.get(pid) or before_patients.get(pid) or {}).get("patient_name") or f"Patient {pid}"}
+                    for pid in removed_patient_ids
+                ]
+
+            before_test_map: dict[tuple[int, str], dict] = {}
+            for patient_id, tests in (before_tests_by_patient or {}).items():
+                patient_name = (after_patients.get(int(patient_id)) or before_patients.get(int(patient_id)) or {}).get("patient_name") or f"Patient {patient_id}"
+                for test in (tests or []):
+                    booked_code = str(test.get("booked_code") or "").strip().upper()
+                    status_text = str(test.get("test_status") or "").strip().lower()
+                    if not booked_code or status_text in {"2", "dropped", "cancelled", "canceled"}:
+                        continue
+                    before_test_map[(int(patient_id), booked_code)] = {
+                        "booked_code": booked_code,
+                        "patient_name": patient_name,
+                        "test_name": self._as_str(test.get("test_name")) or booked_code,
+                    }
+
+            added_test_keys = sorted(set(desired_tests) - set(before_test_map))
+            removed_test_keys = sorted(set(before_test_map) - set(desired_tests))
+            if added_test_keys:
+                new_values["added_tests"] = [
+                    {
+                        "booked_code": desired_tests[key]["booked_code"],
+                        "patient_name": (after_patients.get(key[0]) or before_patients.get(key[0]) or {}).get("patient_name") or f"Patient {key[0]}",
+                        "test_name": desired_tests[key]["test_name"],
+                    }
+                    for key in added_test_keys
+                ]
+            if removed_test_keys:
+                new_values["removed_tests"] = [before_test_map[key] for key in removed_test_keys]
+
+            return new_values or None
 
         try:
             if normalized_action == "complete" and appointment_id is None:
@@ -1139,6 +1230,27 @@ class BookingService:
             if normalized_action == "complete" and payload is not None:
                 appointment_payment_screenshot_paths: dict[int, list[str]] = {}
                 incoming_tests = getattr(payload, "tests_payload", None)
+                patient_updates = getattr(payload, "patient_updates", None) or []
+                if appointment_id is None:
+                    audit_scope_ids = sorted(
+                        {int(getattr(x, "patient_id", 0) or 0) for x in (incoming_tests or []) if int(getattr(x, "patient_id", 0) or 0) > 0}
+                        | {int(x.get("patient_id") or 0) for x in (patient_updates or []) if isinstance(x, dict) and int(x.get("patient_id") or 0) > 0}
+                    )
+                    audit_removed_patient_ids = sorted({int(x.get("patient_id") or 0) for x in (patient_updates or []) if isinstance(x, dict) and int(x.get("patient_id") or 0) > 0 and int(x.get("booking_patient_status") or 0) == 4})
+                    audit_test_scope_ids = sorted(
+                        {int(getattr(x, "patient_id", 0) or 0) for x in (incoming_tests or []) if int(getattr(x, "patient_id", 0) or 0) > 0}
+                        | set(audit_removed_patient_ids)
+                    )
+                    booking_complete_audit_context = {
+                        "scope_patient_ids": audit_scope_ids,
+                        "before_patients": _audit_patient_rows(audit_scope_ids),
+                        "before_tests": self.repository.get_tests_for_booking(
+                            booking.id,
+                            patient_ids=audit_test_scope_ids or None,
+                            pending_only=False,
+                        ) if audit_test_scope_ids else {},
+                        "desired_tests_map": _desired_tests_map(incoming_tests),
+                    }
                 if incoming_tests and appointment_id is None:
                     tests_phase_started_at = perf_counter()
                     save_payload = MobileBookingTestsSaveRequest.model_validate({
@@ -1291,7 +1403,6 @@ class BookingService:
                     patient_ids_scope=_patient_scope_ids,
                 )
                 # Persist patient-level completion fields (APK_TBS/report/payment/pricks/sample collection/cancel metadata).
-                patient_updates = getattr(payload, "patient_updates", None) or []
                 if patient_updates:
                     self.repository.apply_completion_patient_updates(
                         booking_id=booking.id,
@@ -1678,6 +1789,31 @@ class BookingService:
                 patient_scope = "BOOKING_ALL_FALLBACK"
                 source_type = "BOOKING"
                 detail = f"Booking action '{normalized_action}' applied successfully"
+
+                if normalized_action == "complete" and booking_complete_audit_context is not None:
+                    audit_new_values = _build_audit_new_values(
+                        before_patients=booking_complete_audit_context.get("before_patients") or {},
+                        before_tests_by_patient=booking_complete_audit_context.get("before_tests") or {},
+                        desired_tests=booking_complete_audit_context.get("desired_tests_map") or {},
+                        scope_patient_ids=booking_complete_audit_context.get("scope_patient_ids") or [],
+                    )
+                    if audit_new_values:
+                        try:
+                            self.repository._insert_booking_action_audit(
+                                booking_id=int(booking.id),
+                                action_type="COMPLETE",
+                                reason_text=None,
+                                old_values={"value": "Same As Booking"},
+                                new_values=audit_new_values,
+                                done_by=int(user_id),
+                            )
+                            self.repository.db.commit()
+                        except Exception:
+                            self.repository.db.rollback()
+                            self._logger.exception(
+                                "Failed to save booking completion audit delta",
+                                extra={"booking_id": int(booking.id), "user_id": int(user_id)},
+                            )
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -2415,6 +2551,34 @@ class BookingService:
         pct = float(row.get("MaximumpercentageAllowed") or 0)
         return round((float(mrp) * pct) / 100.0, 2) if pct > 0 else 0.0
 
+    def _panel_showmrp_from_address(
+        self,
+        catalog_db: Session | None,
+        comp_cat_id: str | None,
+        panel_name: str | None,
+        fallback: object = None,
+    ) -> bool:
+        if str(fallback or "").strip().lower() in {"1", "true", "yes", "y", "on"}:
+            return True
+        if not catalog_db:
+            return False
+        comp = str(comp_cat_id or "").strip()
+        pname = str(panel_name or "").strip()
+        if not comp or not pname:
+            return False
+        row = catalog_db.execute(
+            text(
+                """
+                SELECT MAX(COALESCE(showmrp, 0)) AS showmrp
+                FROM address
+                WHERE category=:comp
+                  AND TRIM(pname)=:pname
+                """
+            ),
+            {"comp": comp, "pname": pname},
+        ).mappings().first()
+        return int((row or {}).get("showmrp") or 0) == 1
+
     def save_assigned_booking_tests(
         self,
         booking_id: int,
@@ -2491,6 +2655,12 @@ class BookingService:
                     panel_modes.append(selected_mode)
                     panel_names.append(panel_name)
                 is_free_mode = selected_mode == "F"
+                show_mrp = self._panel_showmrp_from_address(
+                    catalog_db,
+                    comp_cat_id,
+                    panel_name,
+                    getattr(panel, "showmrp", None),
+                )
                 for t in (panel.selected_tests or []):
                     booked_code = str(t.booked_code or "").strip().upper()
                     if not booked_code:
@@ -2509,6 +2679,9 @@ class BookingService:
                         if max_allowed < max_discount:
                             max_allowed = max_discount
                         charge = float(t.charge or 0)
+                        if show_mrp:
+                            max_discount = 0.0
+                            charge = mrp
                     subtotal += mrp
                     base_discount += max_discount
                     max_total_discount += max_allowed
