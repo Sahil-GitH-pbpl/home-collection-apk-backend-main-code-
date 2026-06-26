@@ -115,10 +115,7 @@ class BookingService:
 
     def _public_upload_url(self, relative_path: str) -> str:
         rel = "/" + str(relative_path or "").strip().lstrip("/")
-        base = str(self._settings.main_web_domain or "").strip().rstrip("/")
-        if not base:
-            return rel
-        return f"{base}{rel}"
+        return rel
 
     @staticmethod
     def _safe_json_dict(raw_value: object) -> dict:
@@ -633,7 +630,11 @@ class BookingService:
             apk_tbs = self._as_str(row.get("apk_tbs")) or self._as_str(row.get("test_booking_status"))
             manual_hc_slip_paths = payment_screenshot_paths if self._is_manual_hcb_slip(apk_tbs) else []
 
-            patient_tests = tests_by_patient.get(patient_id, []) or []
+            patient_tests = [
+                test
+                for test in (tests_by_patient.get(patient_id, []) or [])
+                if str(test.get("test_status") or "").strip().lower() in {"1", "completed"}
+            ]
             tests_payload.append(
                 {
                     "patient_id": patient_id,
@@ -1769,12 +1770,6 @@ class BookingService:
         if not reason:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cancel reason is required")
 
-        if reschedule_requested and (not str(proposed_visit_date or "").strip() or not str(proposed_time_slot or "").strip()):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Reschedule date and time slot are required when reschedule is requested",
-            )
-
         try:
             if appointment_context:
                 status_code, _patient_rows, _scope = self.repository.apply_appointment_action(
@@ -1794,7 +1789,7 @@ class BookingService:
                     "detail": "Appointment cancelled successfully",
                 }
 
-            status_code, lead_created, lead_id = self.repository.cancel_booking_with_lead(
+            status_code, lead_created, lead_id = self.repository.cancel_booking_with_reschedule_action(
                 booking_id=booking.id,
                 actor_user_id=user_id,
                 reason_text=reason,
