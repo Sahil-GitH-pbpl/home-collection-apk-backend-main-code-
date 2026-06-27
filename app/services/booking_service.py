@@ -1149,22 +1149,27 @@ class BookingService:
                 if int(row.get("patient_id") or 0) > 0
             }
 
+        def _payload_get(node, key: str, default=None):
+            if isinstance(node, dict):
+                return node.get(key, default)
+            return getattr(node, key, default)
+
         def _desired_tests_map(tests_payload) -> dict[tuple[int, str], dict]:
             desired: dict[tuple[int, str], dict] = {}
             for patient_row in (tests_payload or []):
                 try:
-                    patient_id = int(getattr(patient_row, "patient_id", None) or 0)
+                    patient_id = int(_payload_get(patient_row, "patient_id") or 0)
                 except Exception:
                     patient_id = 0
                 if patient_id <= 0:
                     continue
-                for panel in (getattr(patient_row, "panels", None) or []):
-                    for test in (getattr(panel, "selected_tests", None) or []):
-                        booked_code = str(getattr(test, "booked_code", "") or "").strip().upper()
+                for panel in (_payload_get(patient_row, "panels") or []):
+                    for test in (_payload_get(panel, "selected_tests") or []):
+                        booked_code = str(_payload_get(test, "booked_code", "") or "").strip().upper()
                         if booked_code:
                             desired[(patient_id, booked_code)] = {
                                 "booked_code": booked_code,
-                                "test_name": self._as_str(getattr(test, "description", None) or getattr(test, "test_name", None) or booked_code) or booked_code,
+                                "test_name": self._as_str(_payload_get(test, "description") or _payload_get(test, "test_name") or booked_code) or booked_code,
                             }
             return desired
 
@@ -1233,12 +1238,12 @@ class BookingService:
                 patient_updates = getattr(payload, "patient_updates", None) or []
                 if appointment_id is None:
                     audit_scope_ids = sorted(
-                        {int(getattr(x, "patient_id", 0) or 0) for x in (incoming_tests or []) if int(getattr(x, "patient_id", 0) or 0) > 0}
+                        {int(_payload_get(x, "patient_id", 0) or 0) for x in (incoming_tests or []) if int(_payload_get(x, "patient_id", 0) or 0) > 0}
                         | {int(x.get("patient_id") or 0) for x in (patient_updates or []) if isinstance(x, dict) and int(x.get("patient_id") or 0) > 0}
                     )
                     audit_removed_patient_ids = sorted({int(x.get("patient_id") or 0) for x in (patient_updates or []) if isinstance(x, dict) and int(x.get("patient_id") or 0) > 0 and int(x.get("booking_patient_status") or 0) == 4})
                     audit_test_scope_ids = sorted(
-                        {int(getattr(x, "patient_id", 0) or 0) for x in (incoming_tests or []) if int(getattr(x, "patient_id", 0) or 0) > 0}
+                        {int(_payload_get(x, "patient_id", 0) or 0) for x in (incoming_tests or []) if int(_payload_get(x, "patient_id", 0) or 0) > 0}
                         | set(audit_removed_patient_ids)
                     )
                     booking_complete_audit_context = {
@@ -3109,4 +3114,3 @@ class BookingService:
             message="Address updated successfully",
             address=AddressDetails.model_validate(updated),
         )
-
