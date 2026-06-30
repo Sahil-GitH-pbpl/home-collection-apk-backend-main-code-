@@ -1511,6 +1511,7 @@ class BookingService:
                                     booking_id=booking.id,
                                     patient_id=patient_id,
                                     files=prescription_paths,
+                                    uploaded_by=user_id,
                                 )
                             if patient_photo_files:
                                 patient_photo_paths = self._save_booking_patient_photos(

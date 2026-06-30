@@ -2783,17 +2783,23 @@ class BookingRepository:
             return []
         return [x.strip() for x in raw.split(",") if x.strip()]
 
-    def update_patient_prescription_files(self, booking_id: int, patient_id: int, files: list[str]) -> None:
+    def update_patient_prescription_files(self, booking_id: int, patient_id: int, files: list[str], uploaded_by: int) -> None:
         csv_value = ",".join(files)
         self.db.execute(
             text(
                 """
                 UPDATE hhome_collection_booking_patient
-                SET prescription_files = :prescription_files
+                SET prescription_files = :prescription_files,
+                    pres_up_by = :uploaded_by
                 WHERE booking_id = :booking_id AND patient_id = :patient_id
                 """
             ),
-            {"prescription_files": csv_value, "booking_id": int(booking_id), "patient_id": int(patient_id)},
+            {
+                "prescription_files": csv_value,
+                "uploaded_by": str(int(uploaded_by or 0)),
+                "booking_id": int(booking_id),
+                "patient_id": int(patient_id),
+            },
         )
 
     def get_patient_photo_paths(self, booking_id: int, patient_id: int) -> list[str]:
