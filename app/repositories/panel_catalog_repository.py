@@ -16,6 +16,7 @@ class PanelCatalogRepository:
                     a.pname,
                     a.category AS CompCatID,
                     a.BillingChargeMode,
+                    COALESCE(a.showmrp, 0) AS showmrp,
                     c.CatDetails
                 FROM address a
                 LEFT JOIN compcategory c

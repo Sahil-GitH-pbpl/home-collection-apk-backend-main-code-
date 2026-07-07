@@ -1809,6 +1809,63 @@ class BookingRepository:
         ticket_id = int(ins.lastrowid or 0)
         return ticket_id or None
 
+    def _create_cancel_reschedule_lead(
+        self,
+        *,
+        booking_id: int,
+        actor_user_id: int,
+        reason_text: str,
+        remark: str | None,
+        caller_mobile: str,
+        patient_names: str,
+        patient_count: int,
+    ) -> str | None:
+        user_row = self.db.execute(
+            text("SELECT name FROM users WHERE id=:id LIMIT 1"),
+            {"id": int(actor_user_id or 0)},
+        ).mappings().first() or {}
+        created_by = str(user_row.get("name") or actor_user_id or "system").strip()
+        remark_txt = str(remark or "").strip()
+        remarks = "\n".join(
+            [
+                f"Booking ID: {int(booking_id)}",
+                f"Cancel Reason: {str(reason_text or '').strip()}",
+                f"Remark: {remark_txt}",
+                "Reschedule requested from APK, but date/time was not provided.",
+            ]
+        )
+        ins = self.db.execute(
+            text(
+                """
+                INSERT INTO leads
+                (phone, wa_only, name, alt_phone, alt_wa_only, visit_window, prescription,
+                 remarks, tags, num_patients, created_by, status, reason, next_action)
+                VALUES (:phone, 0, :name, '', 0, :visit_window, '',
+                 :remarks, :tags, :num_patients, :created_by, 'Open', :reason, :next_action)
+                """
+            ),
+            {
+                "phone": str(caller_mobile or "").strip(),
+                "name": str(patient_names or "").strip() or None,
+                "visit_window": "Reschedule",
+                "remarks": remarks,
+                "tags": "HC Cancel Reschedule",
+                "num_patients": str(int(patient_count or 1)),
+                "created_by": created_by,
+                "reason": "Reschedule date/time required",
+                "next_action": "Call patient to confirm reschedule date/time",
+            },
+        )
+        new_id = int(ins.lastrowid or 0)
+        if new_id <= 0:
+            return None
+        lead_id = f"LD-{new_id:03d}"
+        self.db.execute(
+            text("UPDATE leads SET lead_id=:lead_id WHERE id=:id"),
+            {"lead_id": lead_id, "id": new_id},
+        )
+        return lead_id
+
     def cancel_booking_with_reschedule_action(
         self,
         booking_id: int,
@@ -1910,6 +1967,17 @@ class BookingRepository:
         remark_txt = str(remark or "").strip()
 
         if bool(reschedule_requested) and not (proposed_date_norm and proposed_slot_norm):
+            lead_id = self._create_cancel_reschedule_lead(
+                booking_id=int(booking_id),
+                actor_user_id=int(actor_user_id),
+                reason_text=reason,
+                remark=remark_txt,
+                caller_mobile=mobile,
+                patient_names=patient_names,
+                patient_count=patient_count,
+            )
+            lead_created = bool(lead_id)
+        elif not bool(reschedule_requested):
             odt_ticket_id = self._create_cancel_odt_ticket(
                 booking_id=int(booking_id),
                 actor_user_id=int(actor_user_id),
@@ -3858,7 +3926,7 @@ class BookingRepository:
         rows = self.db.execute(
             text(
                 f"""
-                SELECT t.patient_id, COALESCE(t.mrp,0) AS mrp, COALESCE(t.max_discount,0) AS max_discount
+                SELECT t.patient_id, COALESCE(t.mrp,0) AS mrp, COALESCE(t.charge,0) AS charge
                 FROM hhome_collection_booking_patient_test t
                 WHERE t.booking_id=:booking_id AND {active_expr}=0
                 """
@@ -3908,14 +3976,14 @@ class BookingRepository:
         for r in rows:
             pid = int(r.get("patient_id") or 0)
             mrp = float(r.get("mrp") or 0)
-            md = float(r.get("max_discount") or 0)
+            charge = max(0.0, float(r.get("charge") or 0))
             subtotal += mrp
-            base_discount += md
             mode = mode_map.get(pid, "")
             if ("C" in mode) and ("P" not in mode):
                 credit_amount += mrp
             else:
-                paying_amount += max(0.0, mrp - md)
+                paying_amount += charge
+                base_discount += max(0.0, mrp - charge)
 
         final_discount = base_discount + float(addl_total or 0)
         total_amount = max(0.0, subtotal - final_discount)

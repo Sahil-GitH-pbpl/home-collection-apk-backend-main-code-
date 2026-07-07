@@ -71,12 +71,15 @@ class PanelCatalogService:
                     "pname": pname,
                     "CompCatID": comp,
                     "CatDetails": self._clean(row.CatDetails),
+                    "showmrp": 0,
                     "_modes": set(),
                 },
             )
             mode = self._normalize_billing_mode(row.BillingChargeMode)
             for ch in mode:
                 item["_modes"].add(ch)
+            if int(row.showmrp or 0):
+                item["showmrp"] = 1
 
         panels: list[dict[str, Any]] = []
         for panel in sorted(panel_map.values(), key=lambda x: (x["pname"].lower(), x["CompCatID"])):
