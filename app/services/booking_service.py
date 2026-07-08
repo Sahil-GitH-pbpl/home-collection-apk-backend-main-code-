@@ -858,6 +858,24 @@ class BookingService:
         catalog_db: Session | None = None,
     ) -> BookingDetailsResponse:
         started_at = perf_counter()
+        if appointment_id is None:
+            appt_row = self.repository.db.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM hhome_collection_booking_appointment
+                    WHERE booking_id = :booking_id
+                      AND assigned_phlebotomist_id = :user_id
+                      AND COALESCE(appointment_status, 0) IN (0, 1, 2)
+                    ORDER BY preferred_visit_date ASC, preferred_time_slot ASC, id DESC
+                    LIMIT 1
+                    """
+                ),
+                {"booking_id": int(booking_id), "user_id": int(user_id)},
+            ).mappings().first()
+            if appt_row and appt_row.get("id"):
+                appointment_id = int(appt_row.get("id"))
+
         if appointment_id is not None:
             booking = self.repository.get_booking_by_id(booking_id=booking_id)
         else:
@@ -1423,11 +1441,12 @@ class BookingService:
                             appointment_id=int(appointment_id),
                             updates=patient_updates,
                         )
-                    self.repository.handle_cancelled_patient_reschedule(
-                        booking_id=booking.id,
-                        updates=patient_updates,
-                        actor_user_id=user_id,
-                    )
+                    if appointment_id is None:
+                        self.repository.handle_cancelled_patient_reschedule(
+                            booking_id=booking.id,
+                            updates=patient_updates,
+                            actor_user_id=user_id,
+                        )
 
                 if patient_documents_map:
                     if uploads_phase_started_at == 0.0:
@@ -1762,16 +1781,26 @@ class BookingService:
                         snapshot_payload=payment_snapshot,
                     )
             if appointment_id is not None:
-                final_status, patient_rows, patient_scope = self.repository.apply_appointment_action(
-                    booking_id=booking.id,
-                    appointment_id=appointment_id,
-                    user_id=user_id,
-                    action=normalized_action,
-                    start_time=(getattr(payload, "start_time", None) if payload is not None else None),
-                    start_location=(getattr(payload, "start_location", None) if payload is not None else None),
-                    complete_time=(getattr(payload, "complete_time", None) if payload is not None else None),
-                    complete_location=(getattr(payload, "complete_location", None) if payload is not None else None),
-                )
+                if normalized_action == "complete" and payload is not None and (getattr(payload, "patient_updates", None) or []):
+                    final_status, patient_rows, patient_scope = self.repository.apply_appointment_completion_patientwise(
+                        booking_id=booking.id,
+                        appointment_id=appointment_id,
+                        user_id=user_id,
+                        updates=(getattr(payload, "patient_updates", None) or []),
+                        complete_time=(getattr(payload, "complete_time", None) if payload is not None else None),
+                        complete_location=(getattr(payload, "complete_location", None) if payload is not None else None),
+                    )
+                else:
+                    final_status, patient_rows, patient_scope = self.repository.apply_appointment_action(
+                        booking_id=booking.id,
+                        appointment_id=appointment_id,
+                        user_id=user_id,
+                        action=normalized_action,
+                        start_time=(getattr(payload, "start_time", None) if payload is not None else None),
+                        start_location=(getattr(payload, "start_location", None) if payload is not None else None),
+                        complete_time=(getattr(payload, "complete_time", None) if payload is not None else None),
+                        complete_location=(getattr(payload, "complete_location", None) if payload is not None else None),
+                    )
                 source_type = "APPOINTMENT"
                 detail = f"Appointment action '{normalized_action}' applied successfully"
             else:

@@ -213,7 +213,8 @@ def get_my_assigned_history_detail(
             bp.report_schedule,
             bp.payment_mode,
             bp.payment_amount,
-            TRIM(CONCAT(COALESCE(p.title, ''), ' ', COALESCE(p.full_name, ''))) AS patient_name
+            TRIM(CONCAT(COALESCE(p.title, ''), ' ', COALESCE(p.full_name, ''))) AS patient_name,
+            p.contact_mobile AS patient_mobile
         FROM hhome_collection_booking_patient bp
         LEFT JOIN hpatient_master p ON p.id = bp.patient_id
         WHERE bp.booking_id=:booking_id
@@ -242,6 +243,7 @@ def get_my_assigned_history_detail(
         patients.append(
             {
                 "patient_name": _clean_text(row.get("patient_name")),
+                "patient_mobile": _clean_text(row.get("patient_mobile")),
                 "booking_patient_status": patient_status,
                 "apk_tbs": _clean_text(row.get("apk_tbs")),
                 "ref_by": _clean_text(row.get("ref_by")),

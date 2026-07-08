@@ -710,6 +710,14 @@ class BookingRepository:
                     WHERE b.assigned_phlebotomist_id = :user_id
                       AND b.preferred_visit_date = :target_visit_date
                       {booking_status_sql}
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM hhome_collection_booking_appointment ax
+                          WHERE ax.booking_id = b.id
+                            AND ax.assigned_phlebotomist_id = :user_id
+                            AND ax.preferred_visit_date = :target_visit_date
+                            AND COALESCE(ax.appointment_status, 0) IN (0, 1, 2)
+                      )
                     GROUP BY
                         b.id,
                         b.booking_status,
@@ -2013,6 +2021,234 @@ class BookingRepository:
         self.db.commit()
         return 4, lead_created, lead_id
 
+    def _appointment_tests_snapshot_obj(self, raw_value) -> dict:
+        if isinstance(raw_value, dict):
+            return raw_value
+        if raw_value is None:
+            return {}
+        try:
+            parsed = json.loads(str(raw_value) or "{}")
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _appointment_snapshot_for_patient(self, raw_snapshot, patient_id: int) -> dict:
+        source = self._appointment_tests_snapshot_obj(raw_snapshot)
+        pid_key = str(int(patient_id))
+        out: dict[str, object] = {}
+        for map_name in ("tests_billing_map", "pending_tests_map", "parent_context_map"):
+            src_map = source.get(map_name) if isinstance(source.get(map_name), dict) else {}
+            node = src_map.get(pid_key) or src_map.get(int(patient_id))
+            out[map_name] = {pid_key: node} if isinstance(node, dict) else {}
+        out["flow_type"] = str(source.get("flow_type") or "auto_followup_pending_child").strip() or "auto_followup_pending_child"
+        return out
+
+    def apply_appointment_completion_patientwise(
+        self,
+        booking_id: int,
+        appointment_id: int,
+        user_id: int,
+        updates: list[dict],
+        complete_time: str | None = None,
+        complete_location: str | None = None,
+    ) -> tuple[int, list[dict], str]:
+        cols = self._get_appointment_columns()
+        if not cols:
+            raise ValueError("Appointment table not available")
+        id_col = "id" if "id" in cols else "appointment_id"
+        if "appointment_status" not in cols:
+            raise ValueError("Appointment status column not available")
+
+        select_parts = [
+            "booking_id",
+            "appointment_status",
+            "selected_patient_ids_json" if "selected_patient_ids_json" in cols else "NULL AS selected_patient_ids_json",
+            "payment_snapshot_json" if "payment_snapshot_json" in cols else "NULL AS payment_snapshot_json",
+            "appointment_tests_snapshot_json" if "appointment_tests_snapshot_json" in cols else "NULL AS appointment_tests_snapshot_json",
+        ]
+        where_user = " AND assigned_phlebotomist_id = :user_id" if "assigned_phlebotomist_id" in cols else ""
+        row = self.db.execute(
+            text(
+                f"""
+                SELECT {', '.join(select_parts)}
+                FROM hhome_collection_booking_appointment
+                WHERE {id_col} = :appointment_id
+                  AND booking_id = :booking_id
+                  {where_user}
+                LIMIT 1
+                FOR UPDATE
+                """
+            ),
+            {"appointment_id": int(appointment_id), "booking_id": int(booking_id), "user_id": int(user_id)},
+        ).mappings().first()
+        if not row:
+            raise ValueError("Appointment not found or not assigned to current user")
+
+        current_status = self._normalize_status_code(row.get("appointment_status")) or 0
+        if current_status in {3, 4}:
+            raise ValueError(f"Appointment is in terminal status {current_status}")
+
+        selected_ids = self._parse_selected_patient_ids(row.get("selected_patient_ids_json"))
+        update_map: dict[int, dict] = {}
+        for raw in (updates or []):
+            if not isinstance(raw, dict):
+                continue
+            try:
+                pid = int(raw.get("patient_id") or 0)
+            except Exception:
+                pid = 0
+            if pid > 0:
+                update_map[pid] = raw
+
+        scope_ids = selected_ids or sorted(update_map.keys())
+        if not scope_ids:
+            raise ValueError("Appointment has no selected patients")
+
+        patient_status: dict[int, int] = {}
+        completed_ids: list[int] = []
+        cancel_only_ids: list[int] = []
+        rescheduled_ids: list[int] = []
+        rescheduled_appointment_ids: dict[int, int] = {}
+
+        for pid in scope_ids:
+            row_update = update_map.get(int(pid)) or {}
+            explicit_status = row_update.get("appointment_patient_status")
+            if explicit_status is None:
+                explicit_status = row_update.get("booking_patient_status")
+            try:
+                status_code = int(explicit_status if explicit_status is not None else 3)
+            except Exception:
+                status_code = 3
+            if status_code not in (3, 4):
+                status_code = 3
+            patient_status[int(pid)] = status_code
+            if status_code == 3:
+                completed_ids.append(int(pid))
+            elif status_code == 4:
+                wants_reschedule = bool(row_update.get("reschedule_requested"))
+                res_date = str(row_update.get("reschedule_date") or "").strip()
+                res_slot = str(row_update.get("reschedule_slot") or "").strip()
+                if wants_reschedule and res_date and res_slot:
+                    rescheduled_ids.append(int(pid))
+                else:
+                    cancel_only_ids.append(int(pid))
+
+        status_values = list(patient_status.values())
+        if status_values and all(x == 3 for x in status_values):
+            final_status = 3
+        elif status_values and all(x == 4 for x in status_values):
+            final_status = 4
+        else:
+            final_status = 5
+
+        try:
+            self.db.execute(
+                text(
+                    f"""
+                    UPDATE hhome_collection_booking_appointment
+                    SET appointment_status = :final_status
+                    WHERE {id_col} = :appointment_id
+                      AND booking_id = :booking_id
+                    """
+                ),
+                {"final_status": int(final_status), "appointment_id": int(appointment_id), "booking_id": int(booking_id)},
+            )
+            self._apply_appointment_lifecycle_fields(
+                appointment_id=int(appointment_id),
+                booking_id=int(booking_id),
+                action="complete",
+                complete_time=complete_time,
+                complete_location=complete_location,
+            )
+
+            if completed_ids:
+                self._update_pending_tests_status(
+                    booking_id=int(booking_id),
+                    to_status=1,
+                    patient_ids=completed_ids,
+                )
+            if cancel_only_ids:
+                self._update_pending_tests_status(
+                    booking_id=int(booking_id),
+                    to_status=2,
+                    patient_ids=cancel_only_ids,
+                )
+
+            raw_tests_snapshot = row.get("appointment_tests_snapshot_json")
+            for pid in rescheduled_ids:
+                row_update = update_map.get(int(pid)) or {}
+                new_id = self.create_auto_followup_appointment(
+                    booking_id=int(booking_id),
+                    actor_user_id=int(user_id),
+                    preferred_date=row_update.get("reschedule_date"),
+                    preferred_slot=row_update.get("reschedule_slot"),
+                    selected_patient_ids=[int(pid)],
+                    appointment_tests_snapshot=self._appointment_snapshot_for_patient(raw_tests_snapshot, int(pid)),
+                )
+                if new_id:
+                    rescheduled_appointment_ids[int(pid)] = int(new_id)
+
+            payload = self._appointment_payment_snapshot_obj(row.get("payment_snapshot_json"))
+            if not isinstance(payload.get("payments"), list):
+                payload["payments"] = []
+            if not isinstance(payload.get("payment_screenshots"), dict):
+                payload["payment_screenshots"] = {}
+            if not isinstance(payload.get("summary"), dict):
+                payload["summary"] = {}
+            existing_ctx = payload.get("patient_context") if isinstance(payload.get("patient_context"), dict) else {}
+            merged_ctx = self._build_appointment_patient_context(
+                booking_id=int(booking_id),
+                patient_ids=scope_ids,
+                default_status=None,
+                existing_context=existing_ctx,
+            )
+            for pid in scope_ids:
+                node = merged_ctx.get(str(int(pid))) if isinstance(merged_ctx.get(str(int(pid))), dict) else {}
+                row_update = update_map.get(int(pid)) or {}
+                node["appointment_patient_status"] = int(patient_status.get(int(pid), 3))
+                for src_key in ("cancel_reason", "cancel_remark", "reschedule_requested", "reschedule_date", "reschedule_slot"):
+                    if row_update.get(src_key) is not None:
+                        node[src_key] = row_update.get(src_key)
+                if int(pid) in rescheduled_appointment_ids:
+                    node["rescheduled_appointment_id"] = int(rescheduled_appointment_ids[int(pid)])
+                merged_ctx[str(int(pid))] = node
+            payload["patient_context"] = merged_ctx
+            if "payment_snapshot_json" in cols:
+                self.db.execute(
+                    text(
+                        f"""
+                        UPDATE hhome_collection_booking_appointment
+                        SET payment_snapshot_json = :snapshot_json,
+                            updated_at = NOW()
+                        WHERE {id_col} = :appointment_id
+                          AND booking_id = :booking_id
+                        """
+                    ),
+                    {
+                        "snapshot_json": json.dumps(payload, ensure_ascii=False),
+                        "appointment_id": int(appointment_id),
+                        "booking_id": int(booking_id),
+                    },
+                )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+        selected_booking_id, _appointment_status, selected_ids_after, patient_scope = (
+            self.get_appointment_selected_patient_ids(
+                appointment_id=int(appointment_id),
+                user_id=int(user_id),
+            )
+        )
+        if selected_booking_id is None or int(selected_booking_id) != int(booking_id):
+            patient_scope = "BOOKING_ALL_FALLBACK"
+            selected_ids_after = []
+        patient_rows = self.get_booking_patient_status_rows_filtered(
+            booking_id=int(booking_id),
+            patient_ids=selected_ids_after if selected_ids_after else None,
+        )
+        return int(final_status), patient_rows, patient_scope
     def apply_appointment_action(
         self,
         booking_id: int,
@@ -3446,6 +3682,16 @@ class BookingRepository:
             if patient_id <= 0:
                 continue
 
+            raw_status = row.get("appointment_patient_status")
+            if raw_status is None:
+                raw_status = row.get("booking_patient_status")
+            try:
+                status_code = int(raw_status if raw_status is not None else 3)
+            except Exception:
+                status_code = 3
+            if status_code != 3:
+                continue
+
             try:
                 booking_patient_id = int(row.get("booking_patient_id") or 0)
             except Exception:
@@ -3482,6 +3728,17 @@ class BookingRepository:
             )
 
         if not patients:
+            self.db.execute(
+                text(
+                    """
+                    UPDATE hhome_collection_booking_appointment
+                    SET cmplt_tube=NULL,
+                        updated_at=NOW()
+                    WHERE id=:appointment_id AND booking_id=:booking_id
+                    """
+                ),
+                {"appointment_id": int(appointment_id), "booking_id": int(booking_id)},
+            )
             return
 
         self.db.execute(
@@ -3792,10 +4049,10 @@ class BookingRepository:
         preferred_slot,
         selected_patient_ids: list[int] | None = None,
         appointment_tests_snapshot: dict | None = None,
-    ) -> None:
+    ) -> int | None:
         cols = self._get_appointment_columns()
         if not cols:
-            return
+            return None
 
         src = self.db.execute(
             text("SELECT preferred_visit_date, assigned_phlebotomist_id, selected_address_id, address_snapshot_json FROM hhome_collection_booking WHERE id=:bid LIMIT 1"),
@@ -3831,7 +4088,7 @@ class BookingRepository:
                 },
             ).fetchone()
             if dup:
-                return
+                return int(getattr(dup, "id", 0) or dup[0] or 0) or None
 
         insert_cols = []
         values = []
@@ -3908,18 +4165,19 @@ class BookingRepository:
         if "appointment_status" in cols:
             insert_cols.append("appointment_status")
             values.append(":appointment_status")
-            params["appointment_status"] = 0
+            params["appointment_status"] = 1 if should_assign_same_date else 0
         if "created_by" in cols:
             insert_cols.append("created_by")
             values.append(":created_by")
             params["created_by"] = int(actor_user_id)
 
         if not insert_cols:
-            return
-        self.db.execute(
+            return None
+        ins = self.db.execute(
             text(f"INSERT INTO hhome_collection_booking_appointment ({', '.join(insert_cols)}) VALUES ({', '.join(values)})"),
             params,
         )
+        return int(ins.lastrowid or 0) or None
 
     def _recompute_booking_amounts_from_active_tests(self, booking_id: int) -> None:
         active_expr = "CASE WHEN test_status IS NULL OR TRIM(test_status)='' THEN 0 WHEN UPPER(TRIM(test_status)) IN ('PENDING','0') THEN 0 WHEN UPPER(TRIM(test_status)) IN ('COMPLETED','1') THEN 1 WHEN UPPER(TRIM(test_status)) IN ('DROPPED','CANCELLED','2') THEN 2 ELSE 0 END"
@@ -4185,7 +4443,7 @@ class BookingRepository:
                 JOIN hhome_collection_booking b ON b.id = ap.booking_id
                 WHERE ap.assigned_phlebotomist_id = :user_id
                   AND ap.{appointment_date_col} = :target_visit_date
-                  AND COALESCE(ap.appointment_status, 0) = 3
+                  AND COALESCE(ap.appointment_status, 0) IN (3, 5)
                   AND NULLIF(TRIM(COALESCE(ap.cmplt_tube, '')), '') IS NOT NULL
                 ORDER BY ap.id DESC
                 LIMIT 500
