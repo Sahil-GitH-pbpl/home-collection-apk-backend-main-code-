@@ -1649,6 +1649,10 @@ class BookingRepository:
             cols.append("bkg_ref_flag")
             vals.append(":bkg_ref_flag")
             params["bkg_ref_flag"] = booking_id
+        if "booking_tags" in booking_cols:
+            cols.append("booking_tags")
+            vals.append(":booking_tags")
+            params["booking_tags"] = source_booking.get("booking_tags")
 
         ins = self.db.execute(text(f"INSERT INTO hhome_collection_booking ({', '.join(cols)}) VALUES ({', '.join(vals)})"), params)
         new_booking_id = int(ins.lastrowid or 0)
