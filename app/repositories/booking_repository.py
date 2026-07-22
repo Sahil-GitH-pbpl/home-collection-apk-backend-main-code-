@@ -1751,6 +1751,7 @@ class BookingRepository:
         remark: str | None,
         caller_mobile: str,
         patient_names: str,
+        appointment_id: int | None = None,
     ) -> int | None:
         user_row = self.db.execute(
             text("SELECT name, designation FROM users WHERE id=:id LIMIT 1"),
@@ -1771,15 +1772,18 @@ class BookingRepository:
         ).mappings().first() or {}
         labmate_id = str(patient_ref.get("labmate_pid") or patient_ref.get("patient_code") or "").strip() or None
         remark_txt = str(remark or "").strip()
-        additional_info = "\n".join(
+        info_lines = [f"Booking ID: {int(booking_id)}"]
+        if appointment_id is not None:
+            info_lines.append(f"Appointment ID: {int(appointment_id)}")
+        info_lines.extend(
             [
-                f"Booking ID: {int(booking_id)}",
                 f"Cancel Reason: {str(reason_text or '').strip()}",
                 f"Remark: {remark_txt}",
                 f"Caller Mobile: {str(caller_mobile or '').strip()}",
                 f"Patients: {str(patient_names or '').strip()}",
             ]
         )
+        additional_info = "\n".join(info_lines)
         ins = self.db.execute(
             text(
                 """
@@ -1816,6 +1820,42 @@ class BookingRepository:
         )
         ticket_id = int(ins.lastrowid or 0)
         return ticket_id or None
+
+    def create_cancel_odt_ticket_for_booking(
+        self,
+        *,
+        booking_id: int,
+        actor_user_id: int,
+        reason_text: str,
+        remark: str | None = None,
+        appointment_id: int | None = None,
+    ) -> int | None:
+        lead_meta = self.db.execute(
+            text(
+                """
+                SELECT cm.primary_mobile,
+                       GROUP_CONCAT(DISTINCT TRIM(CONCAT_WS(' ', p.title, p.full_name)) ORDER BY p.full_name SEPARATOR ', ') AS patient_names
+                FROM hhome_collection_booking b
+                INNER JOIN hcaller_master cm ON cm.id=b.caller_id
+                LEFT JOIN hhome_collection_booking_patient bp ON bp.booking_id=b.id
+                LEFT JOIN hpatient_master p ON p.id=bp.patient_id
+                WHERE b.id=:booking_id
+                GROUP BY cm.primary_mobile
+                """
+            ),
+            {"booking_id": int(booking_id)},
+        ).mappings().first() or {}
+        ticket_id = self._create_cancel_odt_ticket(
+            booking_id=int(booking_id),
+            actor_user_id=int(actor_user_id),
+            reason_text=reason_text,
+            remark=remark,
+            caller_mobile=str(lead_meta.get("primary_mobile") or "").strip(),
+            patient_names=str(lead_meta.get("patient_names") or "").strip(),
+            appointment_id=appointment_id,
+        )
+        self.db.commit()
+        return ticket_id
 
     def _create_cancel_reschedule_lead(
         self,
@@ -4548,3 +4588,5 @@ class BookingRepository:
         )
         self.db.commit()
         return updated
+
+

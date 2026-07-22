@@ -1943,13 +1943,21 @@ class BookingService:
 
         try:
             if appointment_context:
+                appointment_id_int = int(appointment_id)
                 status_code, _patient_rows, _scope = self.repository.apply_appointment_action(
                     booking_id=booking.id,
-                    appointment_id=int(appointment_id),
+                    appointment_id=appointment_id_int,
                     user_id=user_id,
                     action="cancel",
                     complete_time=complete_time,
                     complete_location=complete_location,
+                )
+                odt_ticket_id = self.repository.create_cancel_odt_ticket_for_booking(
+                    booking_id=int(booking.id),
+                    actor_user_id=int(user_id),
+                    reason_text=reason,
+                    remark=remark,
+                    appointment_id=appointment_id_int,
                 )
                 return {
                     "ok": True,
@@ -1957,6 +1965,7 @@ class BookingService:
                     "booking_status": int(status_code),
                     "lead_created": False,
                     "lead_id": None,
+                    "odt_ticket_id": odt_ticket_id,
                     "detail": "Appointment cancelled successfully",
                 }
 
@@ -3144,3 +3153,4 @@ class BookingService:
             message="Address updated successfully",
             address=AddressDetails.model_validate(updated),
         )
+

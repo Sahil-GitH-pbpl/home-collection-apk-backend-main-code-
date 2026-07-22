@@ -174,6 +174,7 @@ class BookingCancelResponse(BaseModel):
     booking_status: int
     lead_created: bool = False
     lead_id: str | None = None
+    odt_ticket_id: int | None = None
     detail: str
 
 class AddPatientToBookingRequest(BaseModel):
@@ -366,3 +367,4 @@ class BatchListResponse(BaseModel):
 
 class BatchReadyResponse(BaseModel):
     bookings: list[BatchBookingItem] = Field(default_factory=list)
+
