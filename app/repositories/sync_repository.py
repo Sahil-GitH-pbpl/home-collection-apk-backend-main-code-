@@ -38,6 +38,7 @@ class SyncRepository:
         "title",
         "email",
         "BillingChargeMode",
+        "showinHC",
     )
 
     def __init__(self, db: Session, database_name: str) -> None:
@@ -77,6 +78,26 @@ class SyncRepository:
                   AND TABLE_NAME = :table_name
                   AND COLUMN_NAME <> 'updated_at'
                 ORDER BY ORDINAL_POSITION
+                LIMIT 1
+                """
+            ),
+            {"schema_name": self.database_name, "table_name": table_name},
+        ).mappings().first()
+        if not row:
+            return None
+        return str(row["COLUMN_NAME"])
+
+    def _get_show_in_hc_column(self, table_name: str) -> str | None:
+        if table_name != "address":
+            return None
+        row = self.db.execute(
+            text(
+                """
+                SELECT COLUMN_NAME
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = :schema_name
+                  AND TABLE_NAME = :table_name
+                  AND LOWER(COLUMN_NAME) = 'showinhc'
                 LIMIT 1
                 """
             ),
@@ -173,10 +194,13 @@ class SyncRepository:
 
         params: dict[str, Any] = {"since": since, "limit_plus": limit + 1}
         active_col = self._get_active_flag_column(table_name)
+        show_in_hc_col = self._get_show_in_hc_column(table_name)
         if incremental_col:
             where_parts = [f"`{incremental_col}` > :since"]
             if active_col:
                 where_parts.append(f"`{active_col}` = 1")
+            if show_in_hc_col:
+                where_parts.append(f"`{show_in_hc_col}` = 1")
             if cursor_updated_at is not None and cursor_pk_value is not None:
                 where_parts.append(
                     f"(`{incremental_col}` > :cursor_updated_at OR (`{incremental_col}` = :cursor_updated_at AND {cursor_key_expr} > :cursor_pk_value))"
@@ -196,6 +220,8 @@ class SyncRepository:
             where_parts = []
             if active_col:
                 where_parts.append(f"`{active_col}` = 1")
+            if show_in_hc_col:
+                where_parts.append(f"`{show_in_hc_col}` = 1")
             if cursor_pk_value is not None:
                 where_parts.append(f"{cursor_key_expr} > :cursor_pk_value")
                 params["cursor_pk_value"] = cursor_pk_value

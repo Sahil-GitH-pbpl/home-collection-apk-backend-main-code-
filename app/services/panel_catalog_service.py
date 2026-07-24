@@ -72,6 +72,7 @@ class PanelCatalogService:
                     "CompCatID": comp,
                     "CatDetails": self._clean(row.CatDetails),
                     "showmrp": 0,
+                    "showinHC": 0,
                     "_modes": set(),
                 },
             )
@@ -80,6 +81,8 @@ class PanelCatalogService:
                 item["_modes"].add(ch)
             if int(row.showmrp or 0):
                 item["showmrp"] = 1
+            if int(getattr(row, "showinHC", 0) or 0):
+                item["showinHC"] = 1
 
         panels: list[dict[str, Any]] = []
         for panel in sorted(panel_map.values(), key=lambda x: (x["pname"].lower(), x["CompCatID"])):

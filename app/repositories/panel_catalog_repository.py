@@ -17,12 +17,16 @@ class PanelCatalogRepository:
                     a.category AS CompCatID,
                     a.BillingChargeMode,
                     COALESCE(a.showmrp, 0) AS showmrp,
+                    COALESCE(a.showinHC, 0) AS showinHC,
                     c.CatDetails
                 FROM address a
                 LEFT JOIN compcategory c
                     ON c.CompCatID = a.category
                 WHERE a.pname IS NOT NULL
                   AND TRIM(a.pname) <> ''
+                  AND UPPER(TRIM(a.Atype)) = 'C'
+                  AND COALESCE(a.Active, 0) = 1
+                  AND COALESCE(a.showinHC, 0) = 1
                 """
             )
         ).fetchall()
@@ -89,6 +93,7 @@ class PanelCatalogRepository:
                     MaxDiscount
                 FROM panelrates
                 WHERE BookedFlag = 1
+                  AND COALESCE(Active, 0) = 1
                   AND CompCatID = :comp_id
                 """
             ),
@@ -112,6 +117,7 @@ class PanelCatalogRepository:
                 MaxDiscount
             FROM panelrates
             WHERE BookedFlag = 1
+              AND COALESCE(Active, 0) = 1
               AND CompCatID IN :comp_ids
             """
         ).bindparams(bindparam("comp_ids", expanding=True))
