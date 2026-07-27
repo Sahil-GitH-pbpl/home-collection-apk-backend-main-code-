@@ -30,6 +30,25 @@ class BookingRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
 
+    @staticmethod
+    def _merge_csv_values(*values: object) -> str | None:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            for item in str(value or "").split(","):
+                text_value = item.strip()
+                if not text_value:
+                    continue
+                key = text_value.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(text_value)
+        return ",".join(merged) if merged else None
+
+    def _with_rescheduled_tag(self, existing_raw: object) -> str | None:
+        return self._merge_csv_values(existing_raw, "rescheduled")
+
     def _get_table_columns(self, table_name: str) -> set[str]:
         if table_name not in {
             "haddress_master",
@@ -1652,7 +1671,7 @@ class BookingRepository:
         if "booking_tags" in booking_cols:
             cols.append("booking_tags")
             vals.append(":booking_tags")
-            params["booking_tags"] = source_booking.get("booking_tags")
+            params["booking_tags"] = self._with_rescheduled_tag(source_booking.get("booking_tags"))
 
         ins = self.db.execute(text(f"INSERT INTO hhome_collection_booking ({', '.join(cols)}) VALUES ({', '.join(vals)})"), params)
         new_booking_id = int(ins.lastrowid or 0)
@@ -1939,7 +1958,8 @@ class BookingRepository:
                 """
                 SELECT id, booking_code, caller_id, selected_address_id, address_snapshot_json,
                        booking_status, preferred_visit_date, preferred_time_slot,
-                       F_Apt_Am, credit_amount, paying_amount, F_dis, Ad_dis, total_amount
+                       F_Apt_Am, credit_amount, paying_amount, F_dis, Ad_dis, total_amount,
+                       booking_tags
                 FROM hhome_collection_booking
                 WHERE id=:booking_id
                 LIMIT 1
@@ -3929,7 +3949,7 @@ class BookingRepository:
         patient_cols = self._get_table_columns("hhome_collection_booking_patient")
         has_ref = "bkg_ref_flag" in booking_cols
         src = self.db.execute(
-            text("SELECT id, caller_id, selected_address_id, assigned_phlebotomist_id, address_snapshot_json FROM hhome_collection_booking WHERE id=:bid LIMIT 1"),
+            text("SELECT id, caller_id, selected_address_id, assigned_phlebotomist_id, address_snapshot_json, booking_tags FROM hhome_collection_booking WHERE id=:bid LIMIT 1"),
             {"bid": int(booking_id)},
         ).fetchone()
         if not src:
@@ -3991,6 +4011,10 @@ class BookingRepository:
                 cols.append("bkg_ref_flag")
                 vals.append(":bkg_ref_flag")
                 params["bkg_ref_flag"] = int(booking_id)
+            if "booking_tags" in booking_cols:
+                cols.append("booking_tags")
+                vals.append(":booking_tags")
+                params["booking_tags"] = self._with_rescheduled_tag(getattr(src, "booking_tags", None))
             ins = self.db.execute(text(f"INSERT INTO hhome_collection_booking ({', '.join(cols)}) VALUES ({', '.join(vals)})"), params)
             new_booking_id = int(ins.lastrowid)
             new_code = f"HC26-{new_booking_id}"
