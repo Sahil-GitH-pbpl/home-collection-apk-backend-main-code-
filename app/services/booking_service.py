@@ -180,6 +180,36 @@ class BookingService:
             }
         return meta
 
+    def _panel_center_id_from_address(
+        self,
+        catalog_db: Session | None,
+        comp_cat_id: str | None,
+        panel_name: str | None,
+    ) -> int | None:
+        if not catalog_db:
+            return None
+        comp = str(comp_cat_id or "").strip()
+        pname = str(panel_name or "").strip()
+        if not comp or not pname:
+            return None
+        row = catalog_db.execute(
+            text(
+                """
+                SELECT CenterID
+                FROM address
+                WHERE category=:comp
+                  AND LOWER(TRIM(pname))=LOWER(:pname)
+                LIMIT 1
+                """
+            ),
+            {"comp": comp, "pname": pname},
+        ).mappings().first()
+        try:
+            center_id = int((row or {}).get("CenterID") or 0)
+        except Exception:
+            center_id = 0
+        return center_id or None
+
     def _group_tests_into_panels(self, tests: list[dict], patient_row: dict) -> list[dict]:
         panel_meta = self._panel_meta_for_patient_row(patient_row)
         grouped: dict[tuple[str | None, str | None, str | None], list[dict]] = defaultdict(list)
@@ -756,7 +786,6 @@ class BookingService:
             "time_slot": time_slot,
             "address": address,
             "total_amount": total_amount,
-            "referred_by": self._as_str(getattr(booking, "referred_by", None)),
             "intrnl_rfrncd_by": self._as_str(getattr(booking, "intrnl_rfrncd_by", None)),
             "phlebo_name": self._as_str(phlebo.get("name")) if phlebo else None,
             "phlebo_mobile": self._as_str(phlebo.get("contact")) if phlebo else None,
@@ -970,6 +999,24 @@ class BookingService:
                 patient_ids=selected_patient_ids if selected_patient_ids else None,
                 pending_only=pending_only_tests,
             )
+
+        if catalog_db:
+            center_cache: dict[tuple[str, str], int | None] = {}
+            for patient_tests in tests_by_patient.values():
+                for test in patient_tests or []:
+                    if self._to_float(test.get("max_allowed_discount")) <= 0:
+                        comp_cat_id = self._as_str(test.get("comp_cat_id"))
+                        panel_company = self._as_str(test.get("panel_company"))
+                        center_key = (comp_cat_id or "", (panel_company or "").strip().lower())
+                        if center_key not in center_cache:
+                            center_cache[center_key] = self._panel_center_id_from_address(catalog_db, comp_cat_id, panel_company)
+                        test["max_allowed_discount"] = self._max_allowed_discount_from_panelrates(
+                            catalog_db,
+                            comp_cat_id,
+                            self._as_str(test.get("booked_code")),
+                            self._to_float(test.get("mrp")),
+                            center_cache.get(center_key),
+                        )
 
         patient_items = []
         booking_patient_ids = set()
@@ -2573,7 +2620,14 @@ class BookingService:
         )
 
 
-    def _max_allowed_discount_from_panelrates(self, catalog_db: Session | None, comp_cat_id: str | None, booked_code: str | None, mrp: float) -> float:
+    def _max_allowed_discount_from_panelrates(
+        self,
+        catalog_db: Session | None,
+        comp_cat_id: str | None,
+        booked_code: str | None,
+        mrp: float,
+        center_id: int | None = None,
+    ) -> float:
         if not catalog_db:
             return 0.0
         comp = str(comp_cat_id or "").strip()
@@ -2586,10 +2640,31 @@ class BookingService:
         g, s, t = (m.group(1) or "").upper(), (m.group(2) or "").upper(), (m.group(3) or "").upper()
         if not (g and s and t):
             return 0.0
-        row = catalog_db.execute(
-            text("SELECT MaximumpercentageAllowed FROM panelrates WHERE CompCatID=:comp AND BookedFlag=1 AND GCode=:g AND SCode=:s AND TestCode=:t ORDER BY ABS(COALESCE(MRP,0)-:mrp) LIMIT 1"),
-            {"comp": comp, "g": g, "s": s, "t": t, "mrp": float(mrp)},
-        ).mappings().first()
+        row = None
+        if center_id:
+            row = catalog_db.execute(
+                text(
+                    """
+                    SELECT MaximumpercentageAllowed
+                    FROM panelrates
+                    WHERE CompCatID=:comp
+                      AND CenterID=:center_id
+                      AND BookedFlag=1
+                      AND GCode=:g
+                      AND SCode=:s
+                      AND TestCode=:t
+                    ORDER BY CASE WHEN COALESCE(MaximumpercentageAllowed,0) > 0 THEN 0 ELSE 1 END,
+                             ABS(COALESCE(MRP,0)-:mrp)
+                    LIMIT 1
+                    """
+                ),
+                {"comp": comp, "center_id": int(center_id), "g": g, "s": s, "t": t, "mrp": float(mrp)},
+            ).mappings().first()
+        if not row:
+            row = catalog_db.execute(
+                text("SELECT MaximumpercentageAllowed FROM panelrates WHERE CompCatID=:comp AND BookedFlag=1 AND GCode=:g AND SCode=:s AND TestCode=:t ORDER BY CASE WHEN COALESCE(MaximumpercentageAllowed,0) > 0 THEN 0 ELSE 1 END, ABS(COALESCE(MRP,0)-:mrp) LIMIT 1"),
+                {"comp": comp, "g": g, "s": s, "t": t, "mrp": float(mrp)},
+            ).mappings().first()
         if not row:
             return 0.0
         pct = float(row.get("MaximumpercentageAllowed") or 0)
@@ -2675,6 +2750,14 @@ class BookingService:
                     by_name.setdefault(name_key, comp)
             existing_panel_map[pid] = {"by_name_mode": by_name_mode, "by_name": by_name}
 
+        center_cache: dict[tuple[str, str], int | None] = {}
+
+        def resolve_center_id(comp_cat_id: str | None, panel_name: str | None) -> int | None:
+            center_key = (str(comp_cat_id or "").strip(), str(panel_name or "").strip().lower())
+            if center_key not in center_cache:
+                center_cache[center_key] = self._panel_center_id_from_address(catalog_db, comp_cat_id, panel_name)
+            return center_cache.get(center_key)
+
         for p in (payload.tests_payload or []):
             patient_id = int(p.patient_id)
             panel_comp_ids: list[str] = []
@@ -2719,7 +2802,13 @@ class BookingService:
                         max_discount = float(t.max_discount or 0)
                         max_allowed = float(t.max_allowed_discount or 0)
                         if max_allowed <= 0:
-                            max_allowed = self._max_allowed_discount_from_panelrates(catalog_db, comp_cat_id, booked_code, mrp)
+                            max_allowed = self._max_allowed_discount_from_panelrates(
+                                catalog_db,
+                                comp_cat_id,
+                                booked_code,
+                                mrp,
+                                resolve_center_id(comp_cat_id, panel_name),
+                            )
                         if max_allowed < max_discount:
                             max_allowed = max_discount
                         charge = float(t.charge or 0)
@@ -3076,6 +3165,23 @@ class BookingService:
                         "tube_name": tname,
                     })
 
+        requested_keys = {
+            self._batch_patient_key(row)
+            for row in patients_rows
+            if int(row.get("booking_id") or 0) > 0 and (int(row.get("booking_patient_id") or 0) > 0 or int(row.get("patient_id") or 0) > 0)
+        }
+        if requested_keys:
+            for batch_row in self.repository.list_hhome_collection_batch_payloads_for_user(created_by=user_id):
+                existing_batch_id = int(batch_row.get("id") or 0)
+                for raw_json in (batch_row.get("patients_json"), batch_row.get("tubes_json")):
+                    for item in self._safe_json_list(raw_json):
+                        if isinstance(item, dict) and self._batch_patient_key(item) in requested_keys:
+                            return BatchSaveResponse(
+                                ok=True,
+                                batch_id=existing_batch_id,
+                                detail="Already batched",
+                            )
+
         batch_id = self.repository.insert_hhome_collection_batch(
             batch_json=batch_meta,
             booking_ids=sorted(set(booking_ids)),
@@ -3153,4 +3259,3 @@ class BookingService:
             message="Address updated successfully",
             address=AddressDetails.model_validate(updated),
         )
-

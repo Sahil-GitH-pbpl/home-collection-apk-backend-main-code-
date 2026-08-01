@@ -23,7 +23,6 @@ class HomeCollectionBooking(Base):
     F_dis: Mapped[Optional[float]] = mapped_column(Numeric(10, 2), nullable=True)
     Ad_Dis: Mapped[Optional[float]] = mapped_column(Numeric(10, 2), nullable=False, default=0)
     total_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=False, default=0)
-    referred_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     intrnl_rfrncd_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     booking_tags: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     bkg_ref_flag: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

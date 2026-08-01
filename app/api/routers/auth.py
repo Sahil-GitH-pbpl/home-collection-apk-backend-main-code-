@@ -9,7 +9,7 @@ from app.services.auth_service import AuthService
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
 
 REQUIRED_APP_VERSION_CODE = 5
-REQUIRED_APP_VERSION_NAME = "5.4.6"
+REQUIRED_APP_VERSION_NAME = "5.5.1"
 REQUIRED_PLATFORM = "android"
 
 
