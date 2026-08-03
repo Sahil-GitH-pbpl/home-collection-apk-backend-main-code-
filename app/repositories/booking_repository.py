@@ -1,4 +1,15 @@
+import base64
+import hashlib
+import hmac
 import json
+import logging
+import os
+import threading
+import urllib.error
+import urllib.request
+
+import pymysql
+import pymysql.cursors
 import shutil
 from pathlib import Path
 from datetime import datetime, time, timedelta
@@ -13,6 +24,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+logger = logging.getLogger(__name__)
+
 from app.models.booking import (
     CallerMaster,
     HomeCollectionBooking,
@@ -1764,6 +1777,341 @@ class BookingRepository:
                 )
 
         return {"booking_id": new_booking_id, "booking_code": new_booking_code}
+
+    @staticmethod
+    def _is_no_of_pricks_more_than_one(value: object) -> bool:
+        text_value = str(value or "").strip().lower()
+        if not text_value:
+            return False
+        try:
+            return float(text_value) > 1
+        except (TypeError, ValueError):
+            if text_value.startswith(">"):
+                try:
+                    return float(text_value[1:].strip()) >= 1
+                except (TypeError, ValueError):
+                    return False
+            return text_value in {"2", "3", "4", "5", "two", "three", "four", "five"}
+
+    @staticmethod
+    def _quote_mysql_identifier(value: object) -> str:
+        return "`" + str(value or "").replace("`", "``") + "`"
+
+    @staticmethod
+    def _normalize_whatsapp_target(value: object) -> str | None:
+        digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+        if not digits:
+            return None
+        if len(digits) == 10:
+            return f"91{digits}"
+        if len(digits) == 12 and digits.startswith("91"):
+            return digits
+        if 11 <= len(digits) <= 15:
+            return digits
+        return None
+
+    def _public_response_token(self, case_id: str) -> str:
+        secret = os.getenv("PUBLIC_RESPONSE_TOKEN_SECRET", os.getenv("JWT_SECRET", "supersecret"))
+        exp_epoch = int((datetime.now(self._ist_tz) + timedelta(days=int(os.getenv("PUBLIC_RESPONSE_TOKEN_DEFAULT_DAYS", "3")))).timestamp())
+        body = f"{case_id}||staff_user||{exp_epoch}".encode("utf-8")
+        signature = hmac.new(str(secret or "").encode("utf-8"), body, hashlib.sha256).digest()[:8]
+        return "c2." + base64.urlsafe_b64encode(body + b"." + signature).decode("utf-8").rstrip("=")
+
+    def _send_venepunchre_whatsapp_async(self, *, contact: str | None, hiccup_id: str, message: str) -> None:
+        settings = get_settings()
+        if not settings.local_whatsapp_enabled:
+            return
+        target = self._normalize_whatsapp_target(contact)
+        api_url = str(settings.local_whatsapp_api_url or "").strip()
+        if not target or not api_url:
+            return
+        payload = {
+            "accountId": int(settings.local_whatsapp_account_id or 1),
+            "target": target,
+            "message": message,
+        }
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        request = urllib.request.Request(
+            api_url,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with opener.open(request, timeout=int(settings.pepipost_wa_timeout or 8)) as response:
+                body = response.read().decode("utf-8", errors="replace")
+                logger.info("[venepunchre auto whatsapp] sent hiccup_id=%s target=%s status=%s response=%s", hiccup_id, target, response.status, body[:300])
+        except Exception:
+            logger.exception("[venepunchre auto whatsapp] failed hiccup_id=%s target=%s", hiccup_id, target)
+
+    def _pricks_issue_context(self, *, booking_id: int, patient_id: int, actor_user_id: int, appointment_id: int | None = None) -> dict:
+        appt_join = ""
+        appt_select = "NULL AS appointment_phlebo_id,"
+        params: dict[str, object] = {"booking_id": int(booking_id), "patient_id": int(patient_id), "actor_user_id": int(actor_user_id or 0)}
+        if appointment_id is not None:
+            appt_select = "ap.assigned_phlebotomist_id AS appointment_phlebo_id,"
+            appt_join = "LEFT JOIN hhome_collection_booking_appointment ap ON ap.booking_id=b.id AND ap.id=:appointment_id"
+            params["appointment_id"] = int(appointment_id)
+        row = self.db.execute(
+            text(
+                f"""
+                SELECT b.id AS booking_id, b.booking_code, b.assigned_phlebotomist_id AS booking_phlebo_id,
+                       {appt_select}
+                       cm.primary_mobile AS caller_mobile,
+                       bp.id AS booking_patient_id,
+                       p.patient_code, p.labmate_pid, p.full_name AS patient_name,
+                       p.age_years, p.gender, COALESCE(p.contact_mobile, cm.primary_mobile) AS patient_mobile,
+                       actor.name AS actor_name, actor.designation AS actor_designation,
+                       COALESCE(ap_ph.name, b_ph.name, actor.name) AS phlebo_name,
+                       COALESCE(ap_ph.designation, b_ph.designation, actor.designation) AS phlebo_designation,
+                       COALESCE(ap_ph.contact, b_ph.contact, actor.contact) AS phlebo_contact,
+                       COALESCE(ap_ph.id, b_ph.id, actor.id) AS phlebo_user_id
+                FROM hhome_collection_booking b
+                INNER JOIN hcaller_master cm ON cm.id=b.caller_id
+                INNER JOIN hhome_collection_booking_patient bp ON bp.booking_id=b.id AND bp.patient_id=:patient_id
+                INNER JOIN hpatient_master p ON p.id=bp.patient_id
+                {appt_join}
+                LEFT JOIN users actor ON actor.id=:actor_user_id
+                LEFT JOIN users b_ph ON b_ph.id=b.assigned_phlebotomist_id
+                LEFT JOIN users ap_ph ON ap_ph.id={("ap.assigned_phlebotomist_id" if appointment_id is not None else "NULL")}
+                WHERE b.id=:booking_id
+                LIMIT 1
+                """
+            ),
+            params,
+        ).mappings().first() or {}
+        return dict(row)
+
+    def _ensure_pricks_odt_ticket(self, ctx: dict, actor_user_id: int) -> int | None:
+        booking_id = int(ctx.get("booking_id") or 0)
+        patient_name = self._clean_text(ctx.get("patient_name")) or "-"
+        reason = "Venepuncture issue auto-created because no_of_pricks is more than 1"
+        exists = self.db.execute(
+            text(
+                """
+                SELECT id
+                FROM tickets
+                WHERE ticket_origin='ODT'
+                  AND ticket_category='HC Phlebo Status'
+                  AND additional_info LIKE :booking_line
+                  AND additional_info LIKE :patient_line
+                  AND additional_info LIKE :reason_line
+                LIMIT 1
+                """
+            ),
+            {
+                "booking_line": f"%Booking Id: {booking_id}%",
+                "patient_line": f"%Patient name: {patient_name}%",
+                "reason_line": f"%Short reason: {reason}%",
+            },
+        ).mappings().first()
+        if exists:
+            return int(exists.get("id") or 0) or None
+        additional_info = "\n".join(
+            [
+                f"Booking Id: {booking_id}",
+                f"Patient name: {patient_name}",
+                f"Mobile: {self._clean_text(ctx.get('patient_mobile') or ctx.get('caller_mobile')) or '-'}",
+                f"Phlebo name: {self._clean_text(ctx.get('phlebo_name')) or '-'}",
+                f"No of pricks: {self._clean_text(ctx.get('no_of_pricks')) or 'more than 1'}",
+                f"Short reason: {reason}",
+            ]
+        )
+        ins = self.db.execute(
+            text(
+                """
+                INSERT INTO tickets
+                (source, country_code, mobile_number, patient_name, patient_labmate_id,
+                 client_name, priority, whatsapp_opt_in, ticket_category, commitment_at,
+                 assign_to_user_id, assignment_reason, tags_json, additional_info,
+                 status, created_by, designation, created_at, ticket_origin)
+                VALUES (:source, :country_code, :mobile_number, :patient_name, :patient_labmate_id,
+                 :client_name, :priority, :whatsapp_opt_in, :ticket_category, DATE_ADD(NOW(), INTERVAL 2 HOUR),
+                 :assign_to_user_id, :assignment_reason, :tags_json, :additional_info,
+                 :status, :created_by, :designation, NOW(), :ticket_origin)
+                """
+            ),
+            {
+                "source": "patient",
+                "country_code": "+91",
+                "mobile_number": self._clean_text(ctx.get("patient_mobile") or ctx.get("caller_mobile")),
+                "patient_name": patient_name,
+                "patient_labmate_id": self._clean_text(ctx.get("labmate_pid") or ctx.get("patient_code")),
+                "client_name": None,
+                "priority": "High",
+                "whatsapp_opt_in": 0,
+                "ticket_category": "HC Phlebo Status",
+                "assign_to_user_id": None,
+                "assignment_reason": None,
+                "tags_json": "[]",
+                "additional_info": additional_info,
+                "status": "Open",
+                "created_by": self._clean_text(ctx.get("actor_name")) or str(actor_user_id or "system"),
+                "designation": self._clean_text(ctx.get("actor_designation")),
+                "ticket_origin": "ODT",
+            },
+        )
+        return int(ins.lastrowid or 0) or None
+
+    def _ensure_pricks_venepunchre_record(self, ctx: dict, actor_user_id: int) -> str | None:
+        return self._ensure_pricks_venepunchre_record_external(ctx, actor_user_id)
+    def _open_venepunchre_connection(self):
+        return pymysql.connect(
+            host=os.getenv("VENE_HOST", "10.1.1.53"),
+            port=int(os.getenv("VENE_PORT", "8091")),
+            user=os.getenv("VENE_USER", "root"),
+            password=os.getenv("VENE_PASSWORD", "example"),
+            database=os.getenv("VENE_NAME", "hiccup_ticket"),
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+            autocommit=False,
+            connect_timeout=int(os.getenv("VENE_TIMEOUT", "5")),
+        )
+
+    def _venepunchre_payload_values(self, ctx: dict, actor_user_id: int, hiccup_id: str) -> tuple[dict, str, str]:
+        now_dt = datetime.now(self._ist_tz).replace(tzinfo=None)
+        patient_ref = self._clean_text(ctx.get("labmate_pid") or ctx.get("patient_code"))
+        phlebo_name = self._clean_text(ctx.get("phlebo_name")) or "-"
+        phlebo_designation = self._clean_text(ctx.get("phlebo_designation"))
+        raised_against = f"{phlebo_name} ({phlebo_designation})" if phlebo_designation else phlebo_name
+        reason = "Venepuncture issue auto-created because no_of_pricks is more than 1"
+        description = "\n".join(
+            [
+                reason,
+                f"Booking Id: {int(ctx.get('booking_id') or 0)}",
+                f"Booking Code: {self._clean_text(ctx.get('booking_code')) or '-'}",
+                f"Patient name: {self._clean_text(ctx.get('patient_name')) or '-'}",
+                f"Mobile: {self._clean_text(ctx.get('patient_mobile') or ctx.get('caller_mobile')) or '-'}",
+                f"Phlebo name: {phlebo_name}",
+                f"No of pricks: {self._clean_text(ctx.get('no_of_pricks')) or 'more than 1'}",
+            ]
+        )
+        values = {
+            "hiccup_id": hiccup_id,
+            "raised_by": int(actor_user_id or 0) or None,
+            "raised_by_department": self._clean_text(ctx.get("actor_designation")) or "Home Collection",
+            "hiccup_type": "Person Related",
+            "raised_against": raised_against,
+            "raised_against_department": 0,
+            "description": description,
+            "status": "Open",
+            "raised_against_department_name": phlebo_designation or "",
+            "reported_by_option": "staff",
+            "reported_staff_id": int(actor_user_id or 0) or None,
+            "reported_name_input": "Auto from APK completion",
+            "location_name_input": "home collection",
+            "venepunchre_staff_id": int(ctx.get("phlebo_user_id") or 0) or None,
+            "patient_billing_done": "yes",
+            "patient_identifier": patient_ref,
+            "patient_name_input": self._clean_text(ctx.get("patient_name")),
+            "patient_age_input": self._clean_text(ctx.get("age_years")),
+            "patient_gender_input": self._clean_text(ctx.get("gender")),
+            "patient_mobile_input": self._clean_text(ctx.get("patient_mobile") or ctx.get("caller_mobile")),
+            "created_by_user_id": int(actor_user_id or 0) or None,
+            "created_by_name": self._clean_text(ctx.get("actor_name")) or str(actor_user_id or "system"),
+            "created_at": now_dt,
+            "updated_at": now_dt,
+        }
+        base_url = os.getenv("PUBLIC_RESPONSE_EXTERNAL_BASE_URL", "https://labmate.bhasinpathlabs.com:4666").rstrip("/")
+        link = f"{base_url}/Venepunchere/{hiccup_id}/{self._public_response_token(hiccup_id)}"
+        message = "\n".join(
+            [
+                "New Venepuncture Raised!",
+                f"ID: {hiccup_id}",
+                f"Raised By: {values['created_by_name']} ({values['raised_by_department']})",
+                f"Raised Against: {raised_against}",
+                "Type: Person Related",
+                f"Time: {now_dt.strftime('%Y-%m-%d %H:%M')}",
+                f"Summary: {reason}",
+                "",
+                f"Tap to respond : {link}",
+                f"Patient ID: {patient_ref or '-'}",
+                f"Patient Name: {values.get('patient_name_input') or '-'}",
+                f"Patient Mobile: {values.get('patient_mobile_input') or '-'}",
+            ]
+        )
+        return values, raised_against, message
+
+    def _ensure_pricks_venepunchre_record_external(self, ctx: dict, actor_user_id: int) -> str | None:
+        booking_id = int(ctx.get("booking_id") or 0)
+        patient_ref = self._clean_text(ctx.get("labmate_pid") or ctx.get("patient_code"))
+        reason = "Venepuncture issue auto-created because no_of_pricks is more than 1"
+        try:
+            conn = self._open_venepunchre_connection()
+        except Exception:
+            logger.exception("[venepunchre auto] VENE DB connection failed booking_id=%s", booking_id)
+            return None
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT hiccup_id
+                    FROM venepunchre_records
+                    WHERE description LIKE %s
+                      AND description LIKE %s
+                      AND (%s IS NULL OR patient_identifier=%s)
+                    LIMIT 1
+                    """,
+                    (f"%Booking Id: {booking_id}%", f"%{reason}%", patient_ref, patient_ref),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    return str(existing.get("hiccup_id") or "").strip() or None
+                cur.execute("SHOW COLUMNS FROM venepunchre_records")
+                columns = {str(row.get("Field")) for row in (cur.fetchall() or [])}
+                prefix = f"VNR-{datetime.now(self._ist_tz).strftime('%y')}-"
+                cur.execute(
+                    """
+                    SELECT MAX(CAST(SUBSTRING_INDEX(hiccup_id, '-', -1) AS UNSIGNED)) AS max_seq
+                    FROM venepunchre_records
+                    WHERE hiccup_id LIKE %s
+                    """,
+                    (f"{prefix}%",),
+                )
+                seq_row = cur.fetchone() or {}
+                hiccup_id = f"{prefix}{int(seq_row.get('max_seq') or 0) + 1:03d}"
+                values, _raised_against, message = self._venepunchre_payload_values(ctx, actor_user_id, hiccup_id)
+                insert_cols = [col for col in values if col in columns]
+                if "hiccup_id" not in insert_cols:
+                    return None
+                sql_cols = ", ".join(self._quote_mysql_identifier(col) for col in insert_cols)
+                sql_vals = ", ".join(["%s"] * len(insert_cols))
+                cur.execute(
+                    f"INSERT INTO venepunchre_records ({sql_cols}) VALUES ({sql_vals})",
+                    tuple(values[col] for col in insert_cols),
+                )
+            conn.commit()
+            threading.Thread(
+                target=self._send_venepunchre_whatsapp_async,
+                kwargs={"contact": self._clean_text(ctx.get("phlebo_contact")), "hiccup_id": hiccup_id, "message": message},
+                daemon=True,
+            ).start()
+            return hiccup_id
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.exception("[venepunchre auto] external insert failed booking_id=%s", booking_id)
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _auto_create_pricks_issue_records(self, *, booking_id: int, patient_id: int, actor_user_id: int, appointment_id: int | None = None, no_of_pricks: object = None) -> None:
+        ctx = self._pricks_issue_context(
+            booking_id=int(booking_id),
+            patient_id=int(patient_id),
+            actor_user_id=int(actor_user_id or 0),
+            appointment_id=appointment_id,
+        )
+        if not ctx:
+            return
+        ctx["no_of_pricks"] = self._clean_text(no_of_pricks)
+        self._ensure_pricks_odt_ticket(ctx, int(actor_user_id or 0))
+        self._ensure_pricks_venepunchre_record(ctx, int(actor_user_id or 0))
 
     def _create_cancel_odt_ticket(
         self,
@@ -3597,6 +3945,7 @@ class BookingRepository:
         include_payment_fields: bool = True,
         recompute_booking_totals: bool = True,
         include_cmplt_tube_field: bool = True,
+        appointment_id: int | None = None,
     ) -> None:
         cols = self._get_table_columns("hhome_collection_booking_patient")
         pm_cols = self._get_table_columns("hpatient_master")
@@ -3709,6 +4058,15 @@ class BookingRepository:
                         """
                     ),
                     params,
+                )
+
+            if self._is_no_of_pricks_more_than_one(row.get("no_of_pricks")):
+                self._auto_create_pricks_issue_records(
+                    booking_id=int(booking_id),
+                    patient_id=int(patient_id),
+                    actor_user_id=int(actor_user_id or 0),
+                    appointment_id=appointment_id,
+                    no_of_pricks=row.get("no_of_pricks"),
                 )
 
             if str(row.get("sample_collection_is") or "").strip().lower() == "tough":
@@ -4616,5 +4974,3 @@ class BookingRepository:
         )
         self.db.commit()
         return updated
-
-

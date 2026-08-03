@@ -1481,6 +1481,7 @@ class BookingService:
                         include_payment_fields=(appointment_id is None),
                         recompute_booking_totals=(appointment_id is None),
                         include_cmplt_tube_field=(appointment_id is None),
+                        appointment_id=(int(appointment_id) if appointment_id is not None else None),
                     )
                     if appointment_id is not None:
                         self.repository.save_appointment_completed_tubes(
