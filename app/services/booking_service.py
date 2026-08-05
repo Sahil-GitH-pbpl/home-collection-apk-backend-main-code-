@@ -2480,11 +2480,29 @@ class BookingService:
         payload: EditPatientInBookingRequest,
         patient_documents: list | None = None,
     ) -> EditPatientInBookingResponse:
-        booking = self.repository.get_assigned_booking_by_id(
-            booking_id=booking_id,
-            user_id=user_id,
-            exclude_cancelled=False,
-        )
+        appointment_id = int(payload.appointment_id or 0)
+        if appointment_id > 0:
+            selected_booking_id, appointment_status, selected_patient_ids, _scope = self.repository.get_appointment_selected_patient_ids(
+                appointment_id=appointment_id,
+                user_id=user_id,
+            )
+            if selected_booking_id is None or int(selected_booking_id) != int(booking_id):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Appointment not found or not assigned to current user",
+                )
+            if int(appointment_status or 0) in {3, 4}:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Completed/cancelled appointment cannot be edited",
+                )
+            booking = self.repository.get_booking_by_id(booking_id)
+        else:
+            booking = self.repository.get_assigned_booking_by_id(
+                booking_id=booking_id,
+                user_id=user_id,
+                exclude_cancelled=False,
+            )
         if not booking:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -2511,6 +2529,11 @@ class BookingService:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Patient is not mapped to this booking",
+            )
+        if appointment_id > 0 and selected_patient_ids and int(requested_patient_id) not in {int(x) for x in selected_patient_ids}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Patient is not selected in this appointment",
             )
 
         updatable_fields: dict = {}
@@ -2579,6 +2602,8 @@ class BookingService:
                     new_alternate_mobile_norm=alternate_norm,
                     primary_mobile_raw=primary_raw,
                     alternate_mobile_raw=alternate_raw,
+                    source_type="APK_APPOINTMENT" if appointment_id > 0 else "APK_BOOKING",
+                    appointment_id=appointment_id or None,
                 )
 
             if files:
@@ -3198,7 +3223,8 @@ class BookingService:
         user_id: int,
         payload: EditBookingAddressRequest,
     ) -> EditBookingAddressResponse:
-        booking = self.repository.get_assigned_booking_by_id(
+        appointment_id = int(payload.appointment_id or 0)
+        booking = self.repository.get_booking_by_id(booking_id) if appointment_id > 0 else self.repository.get_assigned_booking_by_id(
             booking_id=booking_id,
             user_id=user_id,
             exclude_cancelled=False,
@@ -3210,7 +3236,7 @@ class BookingService:
             )
 
         current_status = int(booking.booking_status or 0)
-        if current_status not in {0, 1, 2, 5}:
+        if appointment_id <= 0 and current_status not in {0, 1, 2, 5}:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Address can be updated only for pending/assigned/started/mixed bookings",
@@ -3222,7 +3248,7 @@ class BookingService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Address id is required",
             )
-        if int(booking.selected_address_id or 0) != target_address_id:
+        if appointment_id <= 0 and int(booking.selected_address_id or 0) != target_address_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Only selected booking address can be edited",
@@ -3242,11 +3268,34 @@ class BookingService:
             "google_location": payload.google_location,
             "access_notes": payload.access_notes,
         }
-        updated = self.repository.update_booking_address(
-            booking_id=booking_id,
-            address_id=target_address_id,
-            fields=fields,
-        )
+        if appointment_id > 0:
+            ap = self.repository.get_assigned_appointment_address_context(booking_id, appointment_id, user_id)
+            if not ap:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Appointment not found or not assigned to current user",
+                )
+            target_address_id = int(payload.address_id or ap.get("selected_address_id") or 0)
+            if int(ap.get("selected_address_id") or 0) != target_address_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Only selected appointment address can be edited",
+                )
+            updated = self.repository.update_appointment_address_snapshot(
+                booking_id=booking_id,
+                appointment_id=appointment_id,
+                selected_address_id=target_address_id,
+                fields=fields,
+                actor_user_id=user_id,
+            )
+        else:
+            updated = self.repository.update_booking_address(
+                booking_id=booking_id,
+                address_id=target_address_id,
+                fields=fields,
+                caller_id=int(booking.caller_id or 0),
+                actor_user_id=user_id,
+            )
         if not updated:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

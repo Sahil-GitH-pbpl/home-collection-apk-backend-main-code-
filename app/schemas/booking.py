@@ -223,6 +223,7 @@ class AddPatientToBookingResponse(BaseModel):
 
 
 class EditPatientInBookingRequest(BaseModel):
+    appointment_id: int | None = None
     title: str | None = None
     full_name: str | None = None
     gender: str | None = None
@@ -245,6 +246,7 @@ class EditPatientInBookingResponse(BaseModel):
 
 
 class EditBookingAddressRequest(BaseModel):
+    appointment_id: int | None = None
     address_id: int | None = None
     address_type: str | None = None
     house_flat_no: str | None = None

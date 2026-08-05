@@ -1587,6 +1587,60 @@ class BookingRepository:
             },
         )
 
+    @staticmethod
+    def _audit_changed_values(old_values: dict | None, new_values: dict | None) -> tuple[dict, dict]:
+        old_changed: dict = {}
+        new_changed: dict = {}
+        old_values = old_values or {}
+        for key, new_value in (new_values or {}).items():
+            old_value = old_values.get(key)
+            if hasattr(old_value, "isoformat"):
+                old_value = old_value.isoformat()
+            if hasattr(new_value, "isoformat"):
+                new_value = new_value.isoformat()
+            old_norm = None if old_value is None else str(old_value)
+            new_norm = None if new_value is None else str(new_value)
+            if old_norm != new_norm:
+                old_changed[key] = old_value
+                new_changed[key] = new_value
+        return old_changed, new_changed
+
+    def _insert_patient_address_update_audit(
+        self,
+        *,
+        source_type: str,
+        caller_id: int | None,
+        booking_id: int | None,
+        appointment_id: int | None,
+        patient_id: int | None,
+        address_id: int | None,
+        action_type: str,
+        old_values: dict,
+        new_values: dict,
+        done_by: int,
+    ) -> None:
+        self.db.execute(
+            text(
+                """
+                INSERT INTO hpatient_address_update_audit
+                (source_type, caller_id, booking_id, appointment_id, patient_id, address_id, action_type, old_values_json, new_values_json, done_by)
+                VALUES (:source_type, :caller_id, :booking_id, :appointment_id, :patient_id, :address_id, :action_type, :old_values_json, :new_values_json, :done_by)
+                """
+            ),
+            {
+                "source_type": source_type,
+                "caller_id": caller_id,
+                "booking_id": booking_id,
+                "appointment_id": appointment_id,
+                "patient_id": patient_id,
+                "address_id": address_id,
+                "action_type": action_type,
+                "old_values_json": json.dumps(old_values, ensure_ascii=False, default=str),
+                "new_values_json": json.dumps(new_values, ensure_ascii=False, default=str),
+                "done_by": int(done_by or 0),
+            },
+        )
+
     def _upload_root(self) -> Path:
         return Path(get_settings().patient_documents_upload_base).resolve().parent
 
@@ -2916,9 +2970,23 @@ class BookingRepository:
         new_alternate_mobile_norm: str | None,
         primary_mobile_raw: str | None,
         alternate_mobile_raw: str | None,
+        source_type: str = "APK_BOOKING",
+        appointment_id: int | None = None,
     ) -> dict:
         linked_mobiles: list[str] = []
         try:
+            old_patient = self.db.execute(
+                text(
+                    """
+                    SELECT title, full_name, gender, date_of_birth, age_years,
+                           contact_mobile, alternate_mobile, labmate_pid, panel_company, tag
+                    FROM hpatient_master
+                    WHERE id = :patient_id
+                    LIMIT 1
+                    """
+                ),
+                {"patient_id": int(patient_id)},
+            ).mappings().first()
             set_clauses: list[str] = []
             params: dict = {"patient_id": patient_id, "updated_by": actor_user_id}
             field_map = {
@@ -3075,6 +3143,25 @@ class BookingRepository:
                     new_norm=new_alternate_mobile_norm,
                     new_raw=alternate_mobile_raw,
                     phone_type="PatientAlt",
+                )
+            audit_new = {
+                col_name: update_fields[src_key]
+                for src_key, col_name in field_map.items()
+                if src_key in update_fields
+            }
+            old_changed, new_changed = self._audit_changed_values(dict(old_patient or {}), audit_new)
+            if old_changed:
+                self._insert_patient_address_update_audit(
+                    source_type=source_type,
+                    caller_id=caller_id,
+                    booking_id=booking_id,
+                    appointment_id=appointment_id,
+                    patient_id=patient_id,
+                    address_id=None,
+                    action_type="PATIENT_UPDATE",
+                    old_values=old_changed,
+                    new_values=new_changed,
+                    done_by=actor_user_id,
                 )
 
             self.db.commit()
@@ -4914,13 +5001,91 @@ class BookingRepository:
         ).mappings().first()
         return dict(row) if row else None
 
+    def get_assigned_appointment_address_context(self, booking_id: int, appointment_id: int, user_id: int) -> dict | None:
+        cols = self._get_appointment_columns()
+        if not cols:
+            return None
+        id_col = "id" if "id" in cols else "appointment_id"
+        row = self.db.execute(
+            text(
+                f"""
+                SELECT booking_id, selected_address_id, address_snapshot_json, appointment_status
+                FROM hhome_collection_booking_appointment
+                WHERE {id_col} = :appointment_id
+                  AND booking_id = :booking_id
+                  AND assigned_phlebotomist_id = :user_id
+                LIMIT 1
+                """
+            ),
+            {"appointment_id": int(appointment_id), "booking_id": int(booking_id), "user_id": int(user_id)},
+        ).mappings().first()
+        return dict(row) if row else None
+
+    def update_appointment_address_snapshot(
+        self,
+        *,
+        booking_id: int,
+        appointment_id: int,
+        selected_address_id: int,
+        fields: dict,
+        actor_user_id: int,
+    ) -> dict | None:
+        ap = self.get_assigned_appointment_address_context(booking_id, appointment_id, actor_user_id)
+        if not ap:
+            return None
+        current_status = self._normalize_status_code(ap.get("appointment_status")) or 0
+        if current_status in {3, 4}:
+            raise ValueError(f"Appointment is in terminal status {current_status}")
+        base_snapshot = self._appointment_payment_snapshot_obj(ap.get("address_snapshot_json"))
+        if not base_snapshot:
+            base_snapshot = self.get_address(selected_address_id) or {}
+        new_snapshot = dict(base_snapshot or {})
+        new_snapshot["address_id"] = int(selected_address_id)
+        new_snapshot["id"] = int(selected_address_id)
+        for key, value in (fields or {}).items():
+            if isinstance(value, str):
+                value = value.strip() or None
+            if value is not None:
+                new_snapshot[key] = value
+        self.db.execute(
+            text(
+                """
+                UPDATE hhome_collection_booking_appointment
+                SET selected_address_id = :selected_address_id,
+                    address_snapshot_json = :address_snapshot_json
+                WHERE id = :appointment_id AND booking_id = :booking_id
+                """
+            ),
+            {
+                "selected_address_id": int(selected_address_id),
+                "address_snapshot_json": json.dumps(new_snapshot, ensure_ascii=False, default=str),
+                "appointment_id": int(appointment_id),
+                "booking_id": int(booking_id),
+            },
+        )
+        old_changed, new_changed = self._audit_changed_values(base_snapshot, new_snapshot)
+        if old_changed:
+            self._insert_booking_action_audit(
+                booking_id=booking_id,
+                action_type="MODIFY",
+                reason_text="APK appointment address updated",
+                old_values={"row_type": "APPOINTMENT", "appointment_id": int(appointment_id), "address_snapshot": base_snapshot},
+                new_values={"row_type": "APPOINTMENT", "appointment_id": int(appointment_id), "address_snapshot": new_snapshot},
+                done_by=actor_user_id,
+            )
+        self.db.commit()
+        return new_snapshot
+
     def update_booking_address(
         self,
         booking_id: int,
         address_id: int,
         fields: dict,
+        caller_id: int | None = None,
+        actor_user_id: int | None = None,
     ) -> dict | None:
         cols = self._get_table_columns("haddress_master")
+        old_address = self.get_address(address_id)
         set_parts: list[str] = []
         params: dict[str, object] = {"address_id": int(address_id)}
 
@@ -4962,6 +5127,20 @@ class BookingRepository:
         updated = self.get_address(address_id)
         if not updated:
             return None
+        old_changed, new_changed = self._audit_changed_values(old_address, updated)
+        if old_changed:
+            self._insert_patient_address_update_audit(
+                source_type="APK_BOOKING",
+                caller_id=caller_id,
+                booking_id=booking_id,
+                appointment_id=None,
+                patient_id=None,
+                address_id=address_id,
+                action_type="ADDRESS_UPDATE",
+                old_values=old_changed,
+                new_values=new_changed,
+                done_by=int(actor_user_id or 0),
+            )
         self.db.execute(
             text(
                 """

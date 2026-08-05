@@ -534,6 +534,7 @@ async def edit_patient_in_existing_booking(
         form_files = form.getlist("patient_documents")
         files = [f for f in form_files if isinstance(f, StarletteUploadFile)]
         payload_data = {
+            "appointment_id": _none_if_blank(form.get("appointment_id")),
             "title": _none_if_blank(form.get("title")),
             "full_name": _none_if_blank(form.get("full_name")),
             "gender": _none_if_blank(form.get("gender")),
