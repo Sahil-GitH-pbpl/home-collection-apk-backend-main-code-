@@ -9,8 +9,10 @@ import subprocess
 import threading
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
+import pymysql
 from app.core.config import get_settings
 from app.core.database import CatalogSessionLocal, SessionLocal
 from sqlalchemy import bindparam, text
@@ -75,6 +77,76 @@ def _pdf_public_url(booking_key: str) -> str:
     if not base:
         raise RuntimeError("APK public domain is missing for service note PDF URL generation")
     return f"{base}/static/generated/service_notes/{booking_key}/service_note_{booking_key}.pdf"
+
+
+def _whatsapp_audit_conn():
+    return pymysql.connect(
+        host=os.getenv("WA_PANEL_HOST") or _settings.mysql_host,
+        port=int(os.getenv("WA_PANEL_PORT") or _settings.mysql_port),
+        user=os.getenv("WA_PANEL_USER") or _settings.mysql_user,
+        password=os.getenv("WA_PANEL_PASSWORD") or _settings.mysql_password,
+        database=os.getenv("WA_PANEL_NAME") or "whatsapp",
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+
+def _json_text(value):
+    if value is None:
+        return None
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def _audit_whatsapp_send(action_type, api_type, booking_key, recipient, message, payload, is_success, error_text=None, media_url=None, template_name=None, related_code=None):
+    conn = _whatsapp_audit_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO whatsapp_send_logs
+                  (action_type, api_type, related_id, related_code, recipient, message_text,
+                   template_name, payload_json, media_url, is_success, error_text, sent_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    action_type,
+                    api_type,
+                    booking_key,
+                    str(related_code or booking_key),
+                    recipient,
+                    message,
+                    template_name,
+                    _json_text(payload),
+                    media_url,
+                    1 if is_success else 0,
+                    None if is_success else (str(error_text or "")[:2000] or None),
+                    datetime.now() if is_success else None,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _save_patient_chat_message(mobile, message, pdf_url, pdf_filename, provider_message_id=None, delivery_remark=""):
+    table_name = os.getenv("WA_PANEL_OUTGOING_TABLE", "ofc_waba_outgoing").replace("`", "``")
+    conn = _whatsapp_audit_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO `{table_name}`
+                  (mobile, msg, img, pdff, docid, imgid, empname,
+                   provider_message_id, delivery_status, delivery_status_remark)
+                VALUES (%s,%s,'',%s,%s,'','APK Complete',%s,'accepted',%s)
+                """,
+                (mobile, message, pdf_filename, pdf_url, provider_message_id, (delivery_remark or "")[:1000]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _patient_whatsapp_targets(payload: dict) -> list[dict[str, str]]:
@@ -322,6 +394,10 @@ def _send_service_note_local_whatsapp(payload: dict, booking_key: str, pdf_path:
 
     message = _service_note_local_message(payload)
     pdf_data = base64.b64encode(pdf_path.read_bytes()).decode("ascii")
+    try:
+        pdf_url = _pdf_public_url(booking_key)
+    except Exception:
+        pdf_url = ""
     timeout = int(_settings.pepipost_wa_timeout or 8)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -336,6 +412,13 @@ def _send_service_note_local_whatsapp(payload: dict, booking_key: str, pdf_path:
                 "filename": pdf_path.name,
             },
         }
+        audit_payload = {
+            "accountId": request_payload["accountId"],
+            "target": target,
+            "message": message,
+            "media_url": pdf_url,
+            "filename": pdf_path.name,
+        }
         data = json.dumps(request_payload).encode("utf-8")
         request = urllib.request.Request(
             api_url,
@@ -346,6 +429,17 @@ def _send_service_note_local_whatsapp(payload: dict, booking_key: str, pdf_path:
         try:
             with opener.open(request, timeout=timeout) as response:
                 body = response.read().decode("utf-8", errors="replace")
+                _audit_whatsapp_send(
+                    "hcb_cmplt_local",
+                    "local",
+                    booking_key,
+                    target,
+                    message,
+                    audit_payload,
+                    True,
+                    media_url=pdf_url or None,
+                    related_code=payload.get("booking_code"),
+                )
                 logger.info(
                     "[service note local whatsapp] sent booking_id=%s target=%s status=%s response=%s",
                     booking_key,
@@ -353,7 +447,19 @@ def _send_service_note_local_whatsapp(payload: dict, booking_key: str, pdf_path:
                     response.status,
                     body,
                 )
-        except Exception:
+        except Exception as exc:
+            _audit_whatsapp_send(
+                "hcb_cmplt_local",
+                "local",
+                booking_key,
+                target,
+                message,
+                audit_payload,
+                False,
+                error_text=str(exc),
+                media_url=pdf_url or None,
+                related_code=payload.get("booking_code"),
+            )
             logger.exception(
                 "[service note local whatsapp] failed booking_id=%s target=%s pdf=%s",
                 booking_key,
@@ -378,6 +484,7 @@ def _send_service_note_whatsapp(payload: dict, booking_key: str, pdf_path: Path)
     media_source = "461089f9-1000-4211-b182-c7f0291f3d45"
     media_apiheader = "custom_data"
     pdf_filename = pdf_path.name
+    message_text = _service_note_local_message(payload)
 
     for target in _patient_whatsapp_targets(payload):
         request_payload = {
@@ -416,6 +523,31 @@ def _send_service_note_whatsapp(payload: dict, booking_key: str, pdf_path: Path)
         try:
             with opener.open(request, timeout=timeout) as response:
                 body = response.read().decode("utf-8", errors="replace")
+                provider_message_id = ""
+                try:
+                    provider_message_id = (json.loads(body).get("data") or {}).get("id") or ""
+                except Exception:
+                    provider_message_id = ""
+                _audit_whatsapp_send(
+                    "hcb_cmplt_official",
+                    "official",
+                    booking_key,
+                    target["recipient_whatsapp"],
+                    message_text,
+                    request_payload,
+                    True,
+                    media_url=pdf_url,
+                    template_name=template_name,
+                    related_code=payload.get("booking_code"),
+                )
+                _save_patient_chat_message(
+                    target["recipient_whatsapp"],
+                    message_text,
+                    pdf_url,
+                    pdf_filename,
+                    provider_message_id=provider_message_id or None,
+                    delivery_remark=body,
+                )
                 logger.info(
                     "[service note whatsapp] sent booking_id=%s recipient=%s status=%s pdf=%s response=%s",
                     booking_key,
@@ -424,7 +556,20 @@ def _send_service_note_whatsapp(payload: dict, booking_key: str, pdf_path: Path)
                     pdf_path,
                     body,
                 )
-        except Exception:
+        except Exception as exc:
+            _audit_whatsapp_send(
+                "hcb_cmplt_official",
+                "official",
+                booking_key,
+                target["recipient_whatsapp"],
+                message_text,
+                request_payload,
+                False,
+                error_text=str(exc),
+                media_url=pdf_url,
+                template_name=template_name,
+                related_code=payload.get("booking_code"),
+            )
             logger.exception(
                 "[service note whatsapp] failed booking_id=%s recipient=%s pdf=%s",
                 booking_key,
